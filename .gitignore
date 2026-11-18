@@ -1,0 +1,10 @@
+dist/
+release/
+build/
+out/
+.vs/
+*.user
+*.suo
+*.pdb
+*.ilk
+*.obj
