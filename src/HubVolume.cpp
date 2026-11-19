@@ -38,6 +38,11 @@ using std::min;
 #include <gdiplus.h>
 #include <initguid.h>
 #include <functiondiscoverykeys_devpkey.h>
+#include <tlhelp32.h>
+#include <commdlg.h>
+
+#include "Json.h"
+#include "Rules.h"
 
 #include <atomic>
 #include <cmath>
@@ -84,6 +89,8 @@ constexpr UINT_PTR kTimerDevices     = 2;
 constexpr UINT_PTR kTimerHealth      = 3;
 constexpr UINT_PTR kTimerEngineRetry = 4;
 constexpr UINT_PTR kTimerTray        = 5;
+constexpr UINT_PTR kTimerRules       = 6;
+constexpr UINT_PTR kTimerSaveConfig  = 7;
 
 // Jeda minimum antar koreksi untuk target yang sama, supaya aplikasi lain yang
 // terus melawan kunci tidak membuat proses ini berputar tanpa batas.
@@ -91,6 +98,7 @@ constexpr ULONGLONG kMinEnforceGapMs = 12;
 constexpr UINT kDeviceDebounceMs  = 400;
 constexpr UINT kHealthIntervalMs  = 30000;
 constexpr UINT kEngineRetryMs     = 5000;
+constexpr UINT kRuleIntervalMs    = 1200;
 constexpr float kLevelTolerance   = 0.004f;
 
 // Penanda perubahan volume yang berasal dari aplikasi ini sendiri.
@@ -140,6 +148,25 @@ std::wstring ExePath() {
     DWORD n = GetModuleFileNameW(nullptr, buf, 1024);
     if (n == 0 || n >= 1024) return {};
     return std::wstring(buf, n);
+}
+
+std::wstring Guid() {
+    GUID g{};
+    if (SUCCEEDED(CoCreateGuid(&g))) {
+        wchar_t buf[40];
+        if (StringFromGUID2(g, buf, 40) > 0) return buf;
+    }
+    return std::to_wstring(GetTickCount64());
+}
+
+std::wstring FileName(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+std::wstring StripExtension(const std::wstring& file) {
+    const size_t dot = file.find_last_of(L'.');
+    return (dot != std::wstring::npos && dot > 0) ? file.substr(0, dot) : file;
 }
 
 }
@@ -205,6 +232,8 @@ struct Row {
 struct Config {
     std::map<std::wstring, LockRec> devLocks;
     std::map<std::wstring, LockRec> appLocks;
+    std::vector<Rule> rules;
+    std::vector<Preset> presets;
     bool trayHintShown = false;
 
     static std::wstring Dir() {
@@ -220,7 +249,51 @@ struct Config {
         }
         return base + L"\\HubVolume";
     }
-    static std::wstring Path() { return Dir() + L"\\config.txt"; }
+    static std::wstring Path() { return Dir() + L"\\config.json"; }
+    static std::wstring LegacyPath() { return Dir() + L"\\config.txt"; }
+    static std::wstring PresetsPath() { return Dir() + L"\\presets.json"; }
+
+    static bool ReadText(const std::wstring& path, std::wstring* out) {
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER sz{};
+        std::string text;
+        if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart <= (1 << 20)) {
+            text.resize(static_cast<size_t>(sz.QuadPart));
+            DWORD got = 0;
+            if (!ReadFile(h, text.data(), static_cast<DWORD>(text.size()), &got, nullptr)) got = 0;
+            text.resize(got);
+        }
+        CloseHandle(h);
+        *out = util::Widen(text);
+        return true;
+    }
+
+    // Ditulis ke berkas sementara lalu di-rename agar config tidak pernah
+    // tertinggal dalam keadaan setengah jadi.
+    static bool WriteText(const std::wstring& path, const std::wstring& text) {
+        CreateDirectoryW(Dir().c_str(), nullptr);
+        const std::string bytes = util::Narrow(text);
+        const std::wstring tmp = path + L".tmp";
+
+        HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD written = 0;
+        BOOL ok = WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+                  written == bytes.size() && FlushFileBuffers(h);
+        CloseHandle(h);
+        if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                return true;
+            Sleep(25);
+        }
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
 
     static std::vector<std::string> Split(const std::string& line) {
         std::vector<std::string> f;
@@ -237,34 +310,80 @@ struct Config {
         long v = std::strtol(s.c_str(), nullptr, 10);
         return static_cast<float>(std::clamp<long>(v, 0, 1000)) / 1000.f;
     }
-    static std::string Clean(const std::wstring& w) {
-        std::string s = util::Narrow(w);
-        for (char& c : s) if (c == '\t' || c == '\n' || c == '\r') c = ' ';
-        return s;
+    static float JsonLevel(const json::Value* v, float fallback = 0.f) {
+        if (!v) return fallback;
+        return static_cast<float>(std::clamp(v->AsNumber(static_cast<double>(fallback) * 1000.0), 0.0, 1000.0) / 1000.0);
     }
 
     void Load() {
-        HANDLE h = CreateFileW(Path().c_str(), GENERIC_READ,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return;
-        LARGE_INTEGER sz{};
-        std::string text;
+        std::wstring text;
+        const bool hadJson = ReadText(Path(), &text);
+        bool loaded = false;
 
-        if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0 && sz.QuadPart <= (1 << 20)) {
-            text.resize(static_cast<size_t>(sz.QuadPart));
-            DWORD got = 0;
-            if (!ReadFile(h, text.data(), static_cast<DWORD>(text.size()), &got, nullptr)) got = 0;
-            text.resize(got);
+        if (hadJson) {
+            json::Value root;
+            if (json::Parse(text, root) && root.type == json::Type::Object) {
+                loaded = true;
+                if (const json::Value* v = root.Find(L"trayHintShown"))
+                    trayHintShown = v->AsBool(false);
+
+                if (const json::Value* list = root.Find(L"devices")) {
+                    for (const json::Value& item : list->items) {
+                        if (item.type != json::Type::Object) continue;
+                        const json::Value* id = item.Find(L"id");
+                        if (!id) continue;
+                        LockRec r;
+                        r.target.level = JsonLevel(item.Find(L"level"));
+                        r.target.muted = item.Find(L"muted") && item.Find(L"muted")->AsBool(false);
+                        r.input = item.Find(L"input") && item.Find(L"input")->AsBool(false);
+                        if (const json::Value* t = item.Find(L"title")) r.title = t->AsString();
+                        const std::wstring key = id->AsString();
+                        if (!key.empty()) devLocks[key] = r;
+                    }
+                }
+                if (const json::Value* list = root.Find(L"apps")) {
+                    for (const json::Value& item : list->items) {
+                        if (item.type != json::Type::Object) continue;
+                        const json::Value* id = item.Find(L"id");
+                        if (!id) continue;
+                        LockRec r;
+                        r.target.level = JsonLevel(item.Find(L"level"));
+                        r.target.muted = item.Find(L"muted") && item.Find(L"muted")->AsBool(false);
+                        if (const json::Value* t = item.Find(L"title")) r.title = t->AsString();
+                        const std::wstring key = id->AsString();
+                        if (!key.empty()) appLocks[key] = r;
+                    }
+                }
+                if (const json::Value* list = root.Find(L"rules")) {
+                    for (const json::Value& item : list->items) {
+                        Rule rule;
+                        if (!rules::FromJson(item, rule)) continue;
+                        if (rule.id.empty()) rule.id = util::Guid();
+                        if (rule.name.empty()) rule.name = util::StripExtension(rule.apps.front());
+                        rules.push_back(std::move(rule));
+                    }
+                }
+            }
         }
-        CloseHandle(h);
+
+        if (!loaded) {
+            LoadLegacy();
+            if (!hadJson) Save();
+        }
+        LoadPresets();
+    }
+
+    void LoadLegacy() {
+        std::wstring text;
+        if (!ReadText(LegacyPath(), &text)) return;
+        const std::string bytes = util::Narrow(text);
 
         size_t pos = 0;
         bool first = true;
-        while (pos < text.size()) {
-            size_t end = text.find('\n', pos);
-            if (end == std::string::npos) end = text.size();
-            std::string line = text.substr(pos, end - pos);
+        while (pos < bytes.size()) {
+            size_t end = bytes.find('\n', pos);
+            if (end == std::string::npos) end = bytes.size();
+            std::string line = bytes.substr(pos, end - pos);
             pos = end + 1;
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (first) { first = false; if (line.rfind("HubVolume-config", 0) != 0) return; continue; }
@@ -289,43 +408,52 @@ struct Config {
         }
     }
 
-    // Ditulis ke berkas sementara lalu di-rename agar config tidak pernah
-    // tertinggal dalam keadaan setengah jadi.
+    void LoadPresets() {
+        std::wstring text;
+        bool ok = false;
+        if (!ReadText(PresetsPath(), &text) || text.empty()) {
+            text = rules::DefaultPresetsJson();
+            WriteText(PresetsPath(), text);
+        }
+        presets = rules::ParsePresets(text, &ok);
+        if (!ok) presets = rules::ParsePresets(rules::DefaultPresetsJson(), &ok);
+    }
+
     bool Save() const {
-        std::string out = "HubVolume-config 1\n";
-        out += std::string("hint\t") + (trayHintShown ? "1" : "0") + "\n";
+        json::Value root = json::MakeObject();
+        json::Put(root, L"version", json::MakeNumber(2));
+        json::Put(root, L"trayHintShown", json::MakeBool(trayHintShown));
+
+        json::Value devices = json::MakeArray();
         for (const auto& kv : devLocks) {
             const LockRec& r = kv.second;
-            out += "dev\t" + Clean(kv.first) + "\t" +
-                   std::to_string(static_cast<int>(std::lround(r.target.level * 1000.f))) + "\t" +
-                   (r.target.muted ? "1" : "0") + "\t" + (r.input ? "1" : "0") + "\t" + Clean(r.title) + "\n";
+            json::Value item = json::MakeObject();
+            json::Put(item, L"id", json::MakeString(kv.first));
+            json::Put(item, L"title", json::MakeString(r.title));
+            json::Put(item, L"level", json::MakeNumber(std::lround(r.target.level * 1000.f)));
+            json::Put(item, L"muted", json::MakeBool(r.target.muted));
+            json::Put(item, L"input", json::MakeBool(r.input));
+            json::Push(devices, std::move(item));
         }
+        json::Put(root, L"devices", std::move(devices));
+
+        json::Value apps = json::MakeArray();
         for (const auto& kv : appLocks) {
             const LockRec& r = kv.second;
-            out += "app\t" + Clean(kv.first) + "\t" +
-                   std::to_string(static_cast<int>(std::lround(r.target.level * 1000.f))) + "\t" +
-                   (r.target.muted ? "1" : "0") + "\t" + Clean(r.title) + "\n";
+            json::Value item = json::MakeObject();
+            json::Put(item, L"id", json::MakeString(kv.first));
+            json::Put(item, L"title", json::MakeString(r.title));
+            json::Put(item, L"level", json::MakeNumber(std::lround(r.target.level * 1000.f)));
+            json::Put(item, L"muted", json::MakeBool(r.target.muted));
+            json::Push(apps, std::move(item));
         }
+        json::Put(root, L"apps", std::move(apps));
 
-        CreateDirectoryW(Dir().c_str(), nullptr);
-        const std::wstring path = Path();
-        const std::wstring tmp = path + L".tmp";
+        json::Value list = json::MakeArray();
+        for (const Rule& rule : rules) json::Push(list, rules::ToJson(rule));
+        json::Put(root, L"rules", std::move(list));
 
-        HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) return false;
-        DWORD written = 0;
-        BOOL ok = WriteFile(h, out.data(), static_cast<DWORD>(out.size()), &written, nullptr) &&
-                  written == out.size() && FlushFileBuffers(h);
-        CloseHandle(h);
-        if (!ok) { DeleteFileW(tmp.c_str()); return false; }
-
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                return true;
-            Sleep(25);
-        }
-        DeleteFileW(tmp.c_str());
-        return false;
+        return WriteText(Path(), json::Stringify(root) + L"\n");
     }
 };
 
@@ -437,9 +565,10 @@ public:
         PostMessageW(notify_, WM_APP_VOLUME, static_cast<WPARAM>(sessionId_), 0);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE OnStateChanged(AudioSessionState state) override {
-        if (state == AudioSessionStateExpired)
-            PostMessageW(notify_, WM_APP_SESSIONS, static_cast<WPARAM>(endpointId_), 0);
+    HRESULT STDMETHODCALLTYPE OnStateChanged(AudioSessionState) override {
+        // Aktif/nonaktif mikrofon adalah sinyal utama rule voice, jadi setiap
+        // perubahan status harus memicu evaluasi, bukan hanya sesi kedaluwarsa.
+        PostMessageW(notify_, WM_APP_SESSIONS, static_cast<WPARAM>(endpointId_), 0);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE OnSessionDisconnected(AudioSessionDisconnectReason) override {
@@ -485,6 +614,30 @@ private:
     HWND notify_;
 };
 
+struct LogEntry {
+    std::wstring clock;
+    std::wstring text;
+};
+
+struct AppInfo {
+    std::wstring exe, name, path;
+    HICON icon = nullptr;
+    bool audio = false;
+    bool mic = false;
+    bool window = false;
+};
+
+struct MasterInfo {
+    bool live = false;
+    Volume now;
+    std::wstring key;
+    std::wstring name;
+    bool locked = false;
+    Volume lockedTo;
+    std::wstring activeNames;
+    int activeCount = 0;
+};
+
 class Engine {
 public:
     explicit Engine(Config& cfg) : cfg_(cfg) {}
@@ -506,16 +659,203 @@ public:
     }
     bool Ready() const { return static_cast<bool>(enumerator_); }
     size_t LockCount() const { return cfg_.devLocks.size() + cfg_.appLocks.size(); }
+    size_t RuleCount() const { return cfg_.rules.size(); }
+    const std::vector<Rule>& Rules() const { return cfg_.rules; }
+    const std::vector<Preset>& Presets() const { return cfg_.presets; }
+    const std::vector<LogEntry>& Log() const { return log_; }
+
+    bool RuleActive(const std::wstring& id) const { return ruleWasActive_.count(id) != 0; }
+
+    MasterInfo Master() {
+        MasterInfo out;
+        const std::wstring id = DefaultRenderId();
+        out.key = id;
+        if (Endpoint* ep = FindEndpoint(id)) {
+            ReadEndpoint(*ep, &out.now);
+            out.live = true;
+            out.name = ep->name;
+        }
+        auto it = cfg_.devLocks.find(id);
+        if (it != cfg_.devLocks.end()) { out.locked = true; out.lockedTo = it->second.target; }
+        for (const Rule& rule : cfg_.rules) {
+            if (!ruleWasActive_.count(rule.id)) continue;
+            ++out.activeCount;
+            if (!out.activeNames.empty()) out.activeNames += L", ";
+            out.activeNames += rule.name;
+        }
+        return out;
+    }
+
+    void SaveRule(Rule rule, bool isNew) {
+        if (rule.id.empty()) rule.id = util::Guid();
+        if (rule.name.empty() && !rule.apps.empty()) rule.name = util::StripExtension(rule.apps.front());
+        if (rule.apps.empty()) return;
+
+        if (isNew) {
+            cfg_.rules.push_back(rule);
+            Log(L"Aturan " + rule.name + L" ditambahkan");
+        } else {
+            for (Rule& existing : cfg_.rules) {
+                if (existing.id != rule.id) continue;
+                existing = rule;
+                break;
+            }
+            Log(L"Aturan " + rule.name + L" diperbarui");
+        }
+        cfg_.Save();
+        UpdateRuleTimer();
+        EvaluateRules();
+        NotifyState();
+    }
+
+    void DeleteRule(const std::wstring& id) {
+        for (auto it = cfg_.rules.begin(); it != cfg_.rules.end(); ++it) {
+            if (it->id != id) continue;
+            Log(L"Aturan " + it->name + L" dihapus");
+            cfg_.rules.erase(it);
+            ruleWasActive_.erase(id);
+            simRules_.erase(id);
+            break;
+        }
+        cfg_.Save();
+        UpdateRuleTimer();
+        EvaluateRules();
+        NotifyState();
+    }
+
+    void SetRuleEnabled(const std::wstring& id, bool on) {
+        for (Rule& rule : cfg_.rules) {
+            if (rule.id != id) continue;
+            rule.enabled = on;
+            Log(rule.name + (on ? L" diaktifkan" : L" dinonaktifkan"));
+            break;
+        }
+        cfg_.Save();
+        UpdateRuleTimer();
+        EvaluateRules();
+        NotifyState();
+    }
+
+    void SetRuleTarget(const std::wstring& id, float level, bool commit) {
+        level = std::clamp(level, 0.f, 1.f);
+        for (Rule& rule : cfg_.rules) {
+            if (rule.id != id) continue;
+            rule.target = level;
+            break;
+        }
+        if (commit) {
+            Log(L"Target " + Percent(level) + L" disimpan");
+            cfg_.Save();
+            EvaluateRules();
+        }
+        NotifyState();
+    }
+
+    void SimulateRule(const std::wstring& id) {
+        for (const Rule& rule : cfg_.rules) {
+            if (rule.id != id) continue;
+            simRules_[id] = GetTickCount64() + 6000;
+            Log(L"Simulasi " + rule.name + L" → volume " + Percent(rule.target));
+            EvaluateRules();
+            NotifyState();
+            return;
+        }
+    }
+
+    AppInfo DescribePath(const std::wstring& path) {
+        AppInfo out;
+        out.path = path;
+        out.exe = util::Lower(util::FileName(path));
+        Identity idn = ResolvePath(path);
+        out.name = idn.name;
+        out.icon = idn.icon;
+        return out;
+    }
+
+    std::vector<AppInfo> RunningApps() {
+        std::vector<AppInfo> out;
+        std::map<std::wstring, size_t> index;
+        std::map<std::wstring, bool> audio, mic;
+
+        for (auto& ep : endpoints_) {
+            for (auto& s : ep->sessions) {
+                if (s->state != AudioSessionStateActive) continue;
+                if (s->render) audio[s->key] = true;
+                else mic[s->key] = true;
+            }
+        }
+
+        std::set<DWORD> windowPids = WindowProcesses();
+        const DWORD selfPid = GetCurrentProcessId();
+        DWORD selfSession = 0;
+        ProcessIdToSessionId(selfPid, &selfSession);
+
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (pe.th32ProcessID == selfPid) continue;
+                    DWORD session = 0;
+                    if (ProcessIdToSessionId(pe.th32ProcessID, &session) && session != selfSession) continue;
+
+                    const std::wstring exe = util::Lower(pe.szExeFile);
+                    const bool a = audio.count(exe) != 0;
+                    const bool m = mic.count(exe) != 0;
+                    const bool w = windowPids.count(pe.th32ProcessID) != 0;
+                    if (!a && !m && !w) continue;
+
+                    const std::wstring path = ProcessPath(pe.th32ProcessID);
+                    if (path.empty()) continue;
+                    const std::wstring key = util::Lower(path);
+
+                    auto found = index.find(key);
+                    if (found == index.end()) {
+                        Identity idn = ResolvePath(path);
+                        AppInfo info;
+                        info.exe = exe;
+                        info.name = idn.name;
+                        info.path = path;
+                        info.icon = idn.icon;
+                        info.audio = a;
+                        info.mic = m;
+                        info.window = w;
+                        index[key] = out.size();
+                        out.push_back(std::move(info));
+                    } else {
+                        AppInfo& info = out[found->second];
+                        info.audio = info.audio || a;
+                        info.mic = info.mic || m;
+                        info.window = info.window || w;
+                    }
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+
+        std::stable_sort(out.begin(), out.end(), [](const AppInfo& a, const AppInfo& b) {
+            if (a.audio != b.audio) return a.audio;
+            if (a.mic != b.mic) return a.mic;
+            if (a.window != b.window) return a.window;
+            return util::Lower(a.name) < util::Lower(b.name);
+        });
+        return out;
+    }
 
     void OnVolumeMessage(uint32_t id) {
         if (Endpoint* ep = FindEndpointById(id)) {
+            Volume cur;
+            if (ReadEndpoint(*ep, &cur) && ep->flow == eRender) HandleManual(Kind::Output, ep->deviceId, cur);
             if (cfg_.devLocks.count(ep->deviceId)) { ep->dirty = true; Pump(); }
-            else if (observed_) { ReadEndpoint(*ep, &ep->cache); NotifyState(); }
+            else if (observed_) { ep->cache = cur; NotifyState(); }
             return;
         }
         if (AppSession* s = FindSessionById(id)) {
+            Volume cur;
+            if (ReadSession(*s, &cur) && s->render) HandleManual(Kind::App, s->key, cur);
             if (cfg_.appLocks.count(s->key)) { s->dirty = true; Pump(); }
-            else if (observed_) { ReadSession(*s, &s->cache); NotifyState(); }
+            else if (observed_) { s->cache = cur; NotifyState(); }
         }
     }
 
@@ -524,6 +864,7 @@ public:
             if (ep->id != endpointId) continue;
             ResyncSessions(*ep);
             Pump();
+            EvaluateRules();
             if (observed_) NotifyState();
             return;
         }
@@ -536,10 +877,15 @@ public:
             case kTimerEnforce: Pump(); break;
             case kTimerDevices:
                 KillTimer(notify_, kTimerDevices);
-                if (Ready()) { ResyncDevices(); Pump(); if (observed_) NotifyState(); }
+                if (Ready()) { ResyncDevices(); Pump(); EvaluateRules(); if (observed_) NotifyState(); }
                 break;
             case kTimerHealth: HealthCheck(); break;
             case kTimerEngineRetry: TryInit(); break;
+            case kTimerRules: EvaluateRules(); break;
+            case kTimerSaveConfig:
+                KillTimer(notify_, kTimerSaveConfig);
+                if (cfgDirty_) { cfgDirty_ = false; cfg_.Save(); }
+                break;
         }
     }
 
@@ -549,9 +895,10 @@ public:
         if (!on || !Ready()) return;
         for (auto& ep : endpoints_) {
             ReadEndpoint(*ep, &ep->cache);
-            if (ep->flow == eRender) ResyncSessions(*ep);
+            ResyncSessions(*ep);
             for (auto& s : ep->sessions) ReadSession(*s, &s->cache);
         }
+        EvaluateRules();
     }
 
     std::vector<Row> Snapshot() {
@@ -585,6 +932,7 @@ public:
 
         std::map<std::wstring, Row> apps;
         for (auto& ep : endpoints_) {
+            if (ep->flow != eRender) continue;
             for (auto& s : ep->sessions) {
                 auto ins = apps.emplace(s->key, Row{});
                 Row& r = ins.first->second;
@@ -623,11 +971,24 @@ public:
 
     void SetLevel(Kind k, const std::wstring& key, float level) {
         level = std::clamp(level, 0.f, 1.f);
-        if (IsLocked(k, key)) return;
+        Group* group = FindGroup(k, key);
+        if (group && group->applied) {
+            group->override = true;
+            group->appliedTarget = level;
+            if (LockRec* lock = LockFor(k, key)) {
+                lock->target.level = level;
+                TouchConfig();
+            }
+        } else if (IsLocked(k, key)) {
+            return;
+        }
+
         if (k == Kind::App) {
-            for (auto& ep : endpoints_)
+            for (auto& ep : endpoints_) {
+                if (ep->flow != eRender) continue;
                 for (auto& s : ep->sessions)
                     if (s->key == key) { s->vol->SetMasterVolume(level, &kOurContext); ReadSession(*s, &s->cache); }
+            }
         } else if (Endpoint* ep = FindEndpoint(key)) {
             ep->vol->SetMasterVolumeLevelScalar(level, &kOurContext);
             ReadEndpoint(*ep, &ep->cache);
@@ -635,11 +996,23 @@ public:
     }
 
     void SetMuted(Kind k, const std::wstring& key, bool muted) {
-        if (IsLocked(k, key)) return;
+        Group* group = FindGroup(k, key);
+        if (group && group->applied) {
+            group->override = true;
+            if (LockRec* lock = LockFor(k, key)) {
+                lock->target.muted = muted;
+                TouchConfig();
+            }
+        } else if (IsLocked(k, key)) {
+            return;
+        }
+
         if (k == Kind::App) {
-            for (auto& ep : endpoints_)
+            for (auto& ep : endpoints_) {
+                if (ep->flow != eRender) continue;
                 for (auto& s : ep->sessions)
                     if (s->key == key) { s->vol->SetMute(muted, &kOurContext); ReadSession(*s, &s->cache); }
+            }
         } else if (Endpoint* ep = FindEndpoint(key)) {
             ep->vol->SetMute(muted, &kOurContext);
             ReadEndpoint(*ep, &ep->cache);
@@ -657,15 +1030,26 @@ public:
             rec.input = (k == Kind::Input);
             bool got = false;
             if (k == Kind::App) {
-                for (auto& ep : endpoints_)
+                for (auto& ep : endpoints_) {
+                    if (ep->flow != eRender) continue;
                     for (auto& s : ep->sessions)
                         if (!got && s->key == key) { got = ReadSession(*s, &rec.target); rec.title = s->name; }
+                }
             } else if (Endpoint* ep = FindEndpoint(key)) {
                 got = ReadEndpoint(*ep, &rec.target);
                 rec.title = ep->name;
             }
             if (!got) return;
-            locks[key] = rec;
+            auto inserted = locks.emplace(key, rec).first;
+
+            // Kunci yang dibuat saat rule aktif harus ikut kembali ke level awal
+            // ketika rule selesai, bukan berhenti di level target rule.
+            if (Group* group = FindGroup(k, key); group && group->applied) {
+                group->lockSaved = true;
+                group->lockPrevLevel = group->baseline.level;
+                group->lockPrevMuted = group->baseline.muted;
+                inserted->second.target.level = group->appliedTarget;
+            }
             MarkDirty(k, key);
             Pump();
         }
@@ -678,6 +1062,7 @@ public:
         if (LockCount() == 0) return;
         cfg_.devLocks.clear();
         cfg_.appLocks.clear();
+        for (auto& kv : groups_) kv.second.lockSaved = false;
         cfg_.Save();
         UpdateHealthTimer();
         NotifyLocks();
@@ -697,6 +1082,8 @@ private:
         Com<ISimpleAudioVolume> vol;
         Com<IAudioSessionEvents> events;
         bool registered = false;
+        bool render = true;
+        AudioSessionState state = AudioSessionStateInactive;
         Volume cache;
         bool dirty = false;
         ULONGLONG lastEnforce = 0;
@@ -727,6 +1114,32 @@ private:
         }
     };
 
+    // Satu target volume yang sedang dipegang satu atau beberapa rule. Baseline
+    // disimpan sekali saat rule pertama aktif agar pelepasan rule tidak menimpa
+    // perubahan yang dibuat pengguna di tengah jalan.
+    struct Group {
+        Kind kind = Kind::Output;
+        std::wstring key, name;
+        bool applied = false;
+        bool pending = false;
+        bool override = false;
+        bool lockSaved = false;
+        Volume baseline;
+        float appliedTarget = 0.f;
+        float lockPrevLevel = 0.f;
+        bool lockPrevMuted = false;
+        int delayMs = 3000;
+        bool restore = true;
+        ULONGLONG pendingAt = 0;
+        std::set<std::wstring> rules;
+    };
+
+    struct Detect {
+        std::map<std::wstring, bool> audio, mic;
+        std::set<std::wstring> processes;
+        std::map<std::wstring, std::vector<std::wstring>> titles;
+    };
+
     HRESULT Init() {
         HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                       __uuidof(IMMDeviceEnumerator), enumerator_.PutVoid());
@@ -742,7 +1155,9 @@ private:
         if (SUCCEEDED(Init())) {
             KillTimer(notify_, kTimerEngineRetry);
             Pump();
+            EvaluateRules();
             UpdateHealthTimer();
+            UpdateRuleTimer();
             if (observed_) NotifyState();
         } else {
             Teardown();
@@ -756,7 +1171,10 @@ private:
             KillTimer(notify_, kTimerEnforce);
             KillTimer(notify_, kTimerDevices);
             KillTimer(notify_, kTimerHealth);
+            KillTimer(notify_, kTimerRules);
+            KillTimer(notify_, kTimerSaveConfig);
         }
+        if (cfgDirty_) { cfgDirty_ = false; cfg_.Save(); }
         endpoints_.clear();
         if (enumerator_ && notifier_) enumerator_->UnregisterEndpointNotificationCallback(notifier_.Get());
         notifier_.Reset();
@@ -767,6 +1185,16 @@ private:
         if (!notify_) return;
         if (Ready() && LockCount() > 0) SetTimer(notify_, kTimerHealth, kHealthIntervalMs, nullptr);
         else KillTimer(notify_, kTimerHealth);
+    }
+
+    void UpdateRuleTimer() {
+        if (!notify_) return;
+        bool any = false;
+        for (const Rule& rule : cfg_.rules) {
+            if (rule.enabled) { any = true; break; }
+        }
+        if (Ready() && any) SetTimer(notify_, kTimerRules, kRuleIntervalMs, nullptr);
+        else KillTimer(notify_, kTimerRules);
     }
 
     void HealthCheck() {
@@ -799,11 +1227,432 @@ private:
     }
     void MarkDirty(Kind k, const std::wstring& key) {
         if (k == Kind::App) {
-            for (auto& ep : endpoints_)
+            for (auto& ep : endpoints_) {
+                if (ep->flow != eRender) continue;
                 for (auto& s : ep->sessions) if (s->key == key) s->dirty = true;
+            }
         } else if (Endpoint* ep = FindEndpoint(key)) {
             ep->dirty = true;
         }
+    }
+
+    static std::wstring Percent(float level) {
+        return std::to_wstring(static_cast<int>(std::lround(std::clamp(level, 0.f, 1.f) * 100.f))) + L"%";
+    }
+
+    void Log(const std::wstring& text) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t clock[16];
+        swprintf(clock, 16, L"%02d:%02d", st.wHour, st.wMinute);
+        log_.insert(log_.begin(), LogEntry{clock, text});
+        if (log_.size() > 40) log_.pop_back();
+    }
+
+    // Perubahan kecil (misalnya saat slider digeser) hanya ditandai, lalu
+    // ditulis sekali setelah jeda agar tidak menulis berkas tiap piksel.
+    void TouchConfig() {
+        cfgDirty_ = true;
+        if (notify_) SetTimer(notify_, kTimerSaveConfig, 400, nullptr);
+    }
+
+    static std::wstring GroupKey(Kind k, const std::wstring& key) {
+        return (k == Kind::App ? L"a:" : L"d:") + key;
+    }
+
+    Group* FindGroup(Kind k, const std::wstring& key) {
+        auto it = groups_.find(GroupKey(k, key));
+        return it == groups_.end() ? nullptr : &it->second;
+    }
+
+    LockRec* LockFor(Kind k, const std::wstring& key) {
+        if (k == Kind::App) {
+            auto it = cfg_.appLocks.find(key);
+            return it == cfg_.appLocks.end() ? nullptr : &it->second;
+        }
+        auto it = cfg_.devLocks.find(key);
+        return it == cfg_.devLocks.end() ? nullptr : &it->second;
+    }
+
+    std::wstring DefaultRenderId() {
+        if (!enumerator_) return {};
+        Com<IMMDevice> dev;
+        if (FAILED(enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, dev.Put()))) return {};
+        LPWSTR raw = nullptr;
+        if (FAILED(dev->GetId(&raw))) return {};
+        return util::TakeCoString(raw);
+    }
+
+    bool ReadValue(Kind k, const std::wstring& key, Volume* out) {
+        if (k == Kind::App) {
+            for (auto& ep : endpoints_) {
+                if (ep->flow != eRender) continue;
+                for (auto& s : ep->sessions) if (s->key == key) return ReadSession(*s, out);
+            }
+            return false;
+        }
+        if (Endpoint* ep = FindEndpoint(key)) return ReadEndpoint(*ep, out);
+        return false;
+    }
+
+    bool ApplyRaw(Kind k, const std::wstring& key, float level) {
+        level = std::clamp(level, 0.f, 1.f);
+        if (k == Kind::App) {
+            bool any = false;
+            for (auto& ep : endpoints_) {
+                if (ep->flow != eRender) continue;
+                for (auto& s : ep->sessions) {
+                    if (s->key != key) continue;
+                    s->vol->SetMasterVolume(level, &kOurContext);
+                    ReadSession(*s, &s->cache);
+                    any = true;
+                }
+            }
+            return any;
+        }
+        if (Endpoint* ep = FindEndpoint(key)) {
+            ep->vol->SetMasterVolumeLevelScalar(level, &kOurContext);
+            ReadEndpoint(*ep, &ep->cache);
+            return true;
+        }
+        return false;
+    }
+
+    void ApplyGroup(Group& group, float target) {
+        ApplyRaw(group.kind, group.key, target);
+        if (LockRec* lock = LockFor(group.kind, group.key)) {
+            if (!group.lockSaved) {
+                group.lockPrevLevel = lock->target.level;
+                group.lockPrevMuted = lock->target.muted;
+                group.lockSaved = true;
+            }
+            lock->target.level = target;
+            cfg_.Save();
+        } else {
+            group.lockSaved = false;
+        }
+        group.applied = true;
+        group.appliedTarget = target;
+    }
+
+    bool RestoreGroup(Group& group) {
+        LockRec* lock = LockFor(group.kind, group.key);
+        if (group.override) {
+            Volume cur;
+            if (lock && ReadValue(group.kind, group.key, &cur)) {
+                lock->target.level = cur.level;
+                lock->target.muted = cur.muted;
+                cfg_.Save();
+            }
+            return false;
+        }
+
+        const bool volume = group.restore;
+        if (volume) ApplyRaw(group.kind, group.key, group.baseline.level);
+        if (lock && group.lockSaved) {
+            lock->target.level = group.lockPrevLevel;
+            lock->target.muted = group.lockPrevMuted;
+            cfg_.Save();
+        }
+        return volume;
+    }
+
+    void HandleManual(Kind kind, const std::wstring& key, const Volume& cur) {
+        auto it = groups_.find(GroupKey(kind, key));
+        if (it == groups_.end()) return;
+        Group& group = it->second;
+        if (!group.applied) return;
+
+        const bool levelSame = std::fabs(cur.level - group.appliedTarget) < kLevelTolerance;
+        const bool muteSame = (cur.muted == group.baseline.muted);
+        if (levelSame && muteSame) return;
+
+        const std::wstring name = group.name;
+        const bool wasPending = group.pending;
+        group.override = true;
+        group.pending = false;
+        group.appliedTarget = cur.level;
+        if (LockRec* lock = LockFor(kind, key)) {
+            lock->target.level = cur.level;
+            lock->target.muted = cur.muted;
+            TouchConfig();
+        }
+        Log(name + L" diubah manual → " + Percent(cur.level));
+        if (wasPending) groups_.erase(it);
+        NotifyState();
+    }
+
+    bool RuleTriggered(const Rule& rule, const Detect& detect, bool simulated) const {
+        if (simulated) return true;
+
+        std::vector<bool> checks;
+        if (rule.cond.mic) {
+            bool hit = false;
+            for (const std::wstring& app : rule.apps) hit = hit || detect.mic.count(app) != 0;
+            checks.push_back(hit);
+        }
+        if (rule.cond.audio) {
+            bool hit = false;
+            for (const std::wstring& app : rule.apps) hit = hit || detect.audio.count(app) != 0;
+            checks.push_back(hit);
+        }
+        if (!rule.cond.processes.empty()) {
+            bool hit = false;
+            for (const std::wstring& process : rule.cond.processes) hit = hit || detect.processes.count(process) != 0;
+            checks.push_back(hit);
+        }
+        if (!rule.cond.titles.empty()) {
+            bool hit = false;
+            for (const std::wstring& app : rule.apps) {
+                auto titles = detect.titles.find(app);
+                if (titles == detect.titles.end()) continue;
+                for (const std::wstring& title : titles->second) {
+                    for (const std::wstring& needle : rule.cond.titles) {
+                        if (rules::ContainsNoCase(title, needle)) { hit = true; break; }
+                    }
+                    if (hit) break;
+                }
+                if (hit) break;
+            }
+            checks.push_back(hit);
+        }
+
+        if (checks.empty()) {
+            for (const std::wstring& app : rule.apps)
+                if (detect.audio.count(app) || detect.mic.count(app)) return true;
+            return false;
+        }
+
+        if (rule.cond.match == L"any") {
+            for (bool hit : checks) if (hit) return true;
+            return false;
+        }
+        for (bool hit : checks) if (!hit) return false;
+        return true;
+    }
+
+    static std::wstring TargetApp(const Rule& rule, const Detect& detect) {
+        for (const std::wstring& app : rule.apps)
+            if (detect.audio.count(app) || detect.mic.count(app)) return app;
+        return rule.apps.empty() ? std::wstring() : rule.apps.front();
+    }
+
+    static BOOL CALLBACK CollectWindowProc(HWND hwnd, LPARAM lp) {
+        auto* pids = reinterpret_cast<std::set<DWORD>*>(lp);
+        if (!IsWindowVisible(hwnd) || GetWindowTextLengthW(hwnd) == 0) return TRUE;
+        if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid) pids->insert(pid);
+        return TRUE;
+    }
+
+    static std::set<DWORD> WindowProcesses() {
+        std::set<DWORD> pids;
+        EnumWindows(&CollectWindowProc, reinterpret_cast<LPARAM>(&pids));
+        return pids;
+    }
+
+    struct TitleScan {
+        const std::map<DWORD, std::wstring>* names = nullptr;
+        Detect* detect = nullptr;
+    };
+
+    static BOOL CALLBACK CollectTitleProc(HWND hwnd, LPARAM lp) {
+        auto* scan = reinterpret_cast<TitleScan*>(lp);
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        const int len = GetWindowTextLengthW(hwnd);
+        if (len <= 0 || len > 512) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        auto it = scan->names->find(pid);
+        if (it == scan->names->end()) return TRUE;
+        std::wstring title(static_cast<size_t>(len) + 1, L'\0');
+        const int got = GetWindowTextW(hwnd, title.data(), len + 1);
+        if (got > 0) {
+            title.resize(static_cast<size_t>(got));
+            scan->detect->titles[it->second].push_back(std::move(title));
+        }
+        return TRUE;
+    }
+
+    void Scan(Detect& detect) {
+        for (auto& ep : endpoints_) {
+            for (auto& s : ep->sessions) {
+                if (s->state != AudioSessionStateActive) continue;
+                if (s->render) detect.audio[s->key] = true;
+                else detect.mic[s->key] = true;
+            }
+        }
+
+        std::map<DWORD, std::wstring> names;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    const std::wstring exe = util::Lower(pe.szExeFile);
+                    detect.processes.insert(exe);
+                    names[pe.th32ProcessID] = exe;
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+
+        TitleScan scan{&names, &detect};
+        EnumWindows(&CollectTitleProc, reinterpret_cast<LPARAM>(&scan));
+    }
+
+    void EvaluateRules() {
+        if (!Ready()) return;
+        const ULONGLONG now = GetTickCount64();
+
+        for (auto it = simRules_.begin(); it != simRules_.end();) {
+            if (it->second > now) ++it;
+            else it = simRules_.erase(it);
+        }
+
+        Detect detect;
+        Scan(detect);
+
+        std::set<std::wstring> active;
+        for (const Rule& rule : cfg_.rules) {
+            if (!rule.enabled) continue;
+            const bool simulated = simRules_.count(rule.id) != 0;
+            if (RuleTriggered(rule, detect, simulated)) active.insert(rule.id);
+        }
+
+        bool changed = false;
+        for (const Rule& rule : cfg_.rules) {
+            const bool was = ruleWasActive_.count(rule.id) != 0;
+            const bool is = active.count(rule.id) != 0;
+            if (is && !was) {
+                Log(rule.name + L" masuk voice → volume " + Percent(rule.target));
+                changed = true;
+            } else if (!is && was) {
+                Log(rule.name + L" keluar voice");
+                changed = true;
+            }
+            if (is) ruleWasActive_[rule.id] = true;
+            else ruleWasActive_.erase(rule.id);
+        }
+
+        struct Desired {
+            Kind kind = Kind::Output;
+            std::wstring key, name;
+            float target = 1.f;
+            int delayMs = 3000;
+            bool restore = true;
+            bool set = false;
+            std::set<std::wstring> rules;
+        };
+
+        std::map<std::wstring, Desired> desired;
+        const std::wstring masterKey = DefaultRenderId();
+        for (const Rule& rule : cfg_.rules) {
+            if (!active.count(rule.id)) continue;
+            const Kind kind = rule.useMaster ? Kind::Output : Kind::App;
+            const std::wstring key = rule.useMaster ? masterKey : TargetApp(rule, detect);
+            if (key.empty()) continue;
+
+            const std::wstring groupKey = GroupKey(kind, key);
+            Desired& want = desired[groupKey];
+            if (!want.set) {
+                want.kind = kind;
+                want.key = key;
+                want.set = true;
+                want.target = rule.target;
+                want.delayMs = rule.delayMs;
+                want.restore = rule.restore;
+                want.name = rule.name;
+            } else if (rule.target < want.target - 0.0001f) {
+                want.target = rule.target;
+                want.delayMs = rule.delayMs;
+                want.restore = rule.restore;
+                want.name = rule.name;
+            }
+            want.rules.insert(rule.id);
+        }
+
+        for (auto it = groups_.begin(); it != groups_.end();) {
+            Group& group = it->second;
+            auto want = desired.find(it->first);
+            if (want == desired.end()) {
+                if (!group.pending) {
+                    group.pending = true;
+                    group.pendingAt = now + static_cast<ULONGLONG>(std::max(0, group.delayMs));
+                    changed = true;
+                }
+                if (now < group.pendingAt) {
+                    ++it;
+                    continue;
+                }
+
+                const std::wstring name = group.name;
+                const bool restored = RestoreGroup(group);
+                if (group.override) Log(name + L" selesai, perubahan manual dipertahankan");
+                else if (restored) Log(L"Volume kembali ke " + Percent(group.baseline.level));
+                else Log(name + L" selesai, volume tetap di " + Percent(group.appliedTarget));
+                changed = true;
+                it = groups_.erase(it);
+                continue;
+            }
+
+            Desired& to = want->second;
+            group.pending = false;
+            group.rules = to.rules;
+            group.delayMs = to.delayMs;
+            group.restore = to.restore;
+            group.name = to.name;
+            if (!group.override && std::fabs(group.appliedTarget - to.target) > kLevelTolerance) {
+                ApplyGroup(group, to.target);
+                Log(group.name + L" target disesuaikan ke " + Percent(to.target));
+                changed = true;
+            }
+            desired.erase(want);
+            ++it;
+        }
+
+        for (auto& kv : desired) {
+            const Desired& want = kv.second;
+            Volume baseline;
+            if (!ReadValue(want.kind, want.key, &baseline)) continue;
+
+            Group group;
+            group.kind = want.kind;
+            group.key = want.key;
+            group.name = want.name;
+            group.rules = want.rules;
+            group.delayMs = want.delayMs;
+            group.restore = want.restore;
+            group.baseline = baseline;
+            ApplyGroup(group, want.target);
+            groups_[kv.first] = std::move(group);
+            changed = true;
+        }
+
+        if (changed) NotifyState();
+    }
+
+    Identity ResolvePath(const std::wstring& path) {
+        const std::wstring cacheKey = util::Lower(path);
+        auto it = identities_.find(cacheKey);
+        if (it != identities_.end()) return it->second;
+
+        Identity idn;
+        const std::wstring file = util::FileName(path);
+        idn.key = util::Lower(file);
+        idn.name = FileDescription(path);
+        if (idn.name.empty()) {
+            std::wstring baseName = util::StripExtension(file);
+            if (!baseName.empty()) baseName[0] = static_cast<wchar_t>(towupper(baseName[0]));
+            idn.name = baseName;
+        }
+        HICON large = nullptr;
+        if (ExtractIconExW(path.c_str(), 0, &large, nullptr, 1) >= 1) idn.icon = large;
+        identities_[cacheKey] = idn;
+        return idn;
     }
 
     static bool ReadEndpoint(Endpoint& ep, Volume* out) {
@@ -910,7 +1759,7 @@ private:
             if (seen.count((*it)->deviceId)) ++it;
             else it = endpoints_.erase(it);
         }
-        for (auto& ep : endpoints_) if (ep->flow == eRender) ResyncSessions(*ep);
+        for (auto& ep : endpoints_) ResyncSessions(*ep);
     }
 
     void AddEndpoint(IMMDevice* dev, const std::wstring& id, EDataFlow flow) {
@@ -925,8 +1774,9 @@ private:
         ep->cbRegistered = SUCCEEDED(ep->vol->RegisterControlChangeNotify(ep->cb.Get()));
         if (!ep->cbRegistered) return;
 
-        if (flow == eRender &&
-            SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, ep->mgr.PutVoid()))) {
+        // Sesi mikrofon juga dibutuhkan untuk mendeteksi panggilan, jadi manager
+        // sesi dibuat untuk kedua arah, bukan hanya perangkat keluaran.
+        if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, ep->mgr.PutVoid()))) {
             ep->notifier.Attach(new SessionNotifier(notify_, ep->id));
             ep->notifierRegistered = SUCCEEDED(ep->mgr->RegisterSessionNotification(ep->notifier.Get()));
         }
@@ -971,27 +1821,7 @@ private:
         if (system) return Identity{L"#system", L"Suara Sistem", nullptr};
         const std::wstring path = ProcessPath(pid);
         if (path.empty()) return Identity{L"pid:" + std::to_wstring(pid), L"Proses " + std::to_wstring(pid), nullptr};
-
-        const std::wstring cacheKey = util::Lower(path);
-        auto it = identities_.find(cacheKey);
-        if (it != identities_.end()) return it->second;
-
-        Identity idn;
-        size_t slash = path.find_last_of(L'\\');
-        std::wstring file = (slash == std::wstring::npos) ? path : path.substr(slash + 1);
-        idn.key = util::Lower(file);
-        idn.name = FileDescription(path);
-        if (idn.name.empty()) {
-            std::wstring baseName = file;
-            size_t dot = baseName.find_last_of(L'.');
-            if (dot != std::wstring::npos && dot > 0) baseName.erase(dot);
-            if (!baseName.empty()) baseName[0] = static_cast<wchar_t>(towupper(baseName[0]));
-            idn.name = baseName;
-        }
-        HICON large = nullptr;
-        if (ExtractIconExW(path.c_str(), 0, &large, nullptr, 1) >= 1) idn.icon = large;
-        identities_[cacheKey] = idn;
-        return idn;
+        return ResolvePath(path);
     }
 
     void ResyncSessions(Endpoint& ep) {
@@ -1016,7 +1846,12 @@ private:
             seen.insert(inst);
 
             bool known = false;
-            for (auto& s : ep.sessions) if (s->instanceId == inst) { known = true; break; }
+            for (auto& s : ep.sessions) {
+                if (s->instanceId != inst) continue;
+                s->state = st;
+                known = true;
+                break;
+            }
             if (!known) AddSession(ep, ctl2, inst);
         }
         for (auto it = ep.sessions.begin(); it != ep.sessions.end();) {
@@ -1029,8 +1864,10 @@ private:
         auto s = std::make_unique<AppSession>();
         s->id = nextId_++;
         s->instanceId = inst;
+        s->render = (ep.flow == eRender);
         s->ctl = ctl2;
         if (FAILED(ctl2->QueryInterface(__uuidof(ISimpleAudioVolume), s->vol.PutVoid()))) return;
+        ctl2->GetState(&s->state);
 
         DWORD pid = 0;
         ctl2->GetProcessId(&pid);
@@ -1052,11 +1889,16 @@ private:
     Config& cfg_;
     HWND notify_ = nullptr;
     bool observed_ = false;
+    bool cfgDirty_ = false;
     uint32_t nextId_ = 1;
     Com<IMMDeviceEnumerator> enumerator_;
     Com<IMMNotificationClient> notifier_;
     std::vector<std::unique_ptr<Endpoint>> endpoints_;
     std::map<std::wstring, Identity> identities_;
+    std::map<std::wstring, Group> groups_;
+    std::map<std::wstring, bool> ruleWasActive_;
+    std::map<std::wstring, ULONGLONG> simRules_;
+    std::vector<LogEntry> log_;
 };
 
 // Sesi GDI+ hidup hanya selama jendela mixer terbuka.
@@ -1077,19 +1919,24 @@ private:
 };
 
 namespace theme {
-inline G::Color Bg()        { return G::Color(255, 26, 27, 32); }
-inline G::Color Card()      { return G::Color(255, 37, 39, 46); }
-inline G::Color Tile()      { return G::Color(255, 55, 58, 70); }
-inline G::Color Border()    { return G::Color(255, 56, 59, 68); }
-inline G::Color Text()      { return G::Color(255, 236, 238, 242); }
-inline G::Color Muted()     { return G::Color(255, 150, 156, 168); }
-inline G::Color Accent()    { return G::Color(255, 84, 150, 255); }
-inline G::Color Amber()     { return G::Color(255, 255, 183, 51); }
-inline G::Color AmberBg()   { return G::Color(255, 70, 56, 22); }
-inline G::Color AmberBgHot(){ return G::Color(255, 88, 70, 26); }
-inline G::Color Track()     { return G::Color(255, 68, 71, 82); }
-inline G::Color Button()    { return G::Color(255, 52, 55, 65); }
-inline G::Color ButtonHot() { return G::Color(255, 66, 70, 82); }
+inline bool gLight = false;
+inline void SetLight(bool light) { gLight = light; }
+
+inline G::Color Bg()        { return gLight ? G::Color(255, 246, 247, 250) : G::Color(255, 26, 27, 32); }
+inline G::Color Card()      { return gLight ? G::Color(255, 255, 255, 255) : G::Color(255, 37, 39, 46); }
+inline G::Color Tile()      { return gLight ? G::Color(255, 236, 239, 244) : G::Color(255, 55, 58, 70); }
+inline G::Color Border()    { return gLight ? G::Color(255, 220, 224, 230) : G::Color(255, 56, 59, 68); }
+inline G::Color Text()      { return gLight ? G::Color(255, 28, 31, 38) : G::Color(255, 236, 238, 242); }
+inline G::Color Muted()     { return gLight ? G::Color(255, 108, 114, 126) : G::Color(255, 150, 156, 168); }
+inline G::Color Accent()    { return gLight ? G::Color(255, 42, 108, 226) : G::Color(255, 84, 150, 255); }
+inline G::Color Amber()     { return gLight ? G::Color(255, 176, 116, 6) : G::Color(255, 255, 183, 51); }
+inline G::Color AmberBg()   { return gLight ? G::Color(255, 255, 243, 218) : G::Color(255, 70, 56, 22); }
+inline G::Color AmberBgHot(){ return gLight ? G::Color(255, 255, 232, 190) : G::Color(255, 88, 70, 26); }
+inline G::Color Track()     { return gLight ? G::Color(255, 218, 222, 229) : G::Color(255, 68, 71, 82); }
+inline G::Color Button()    { return gLight ? G::Color(255, 239, 242, 246) : G::Color(255, 52, 55, 65); }
+inline G::Color ButtonHot() { return gLight ? G::Color(255, 226, 231, 238) : G::Color(255, 66, 70, 82); }
+inline G::Color Green()     { return gLight ? G::Color(255, 16, 137, 62) : G::Color(255, 74, 222, 128); }
+inline G::Color GreenBg()   { return gLight ? G::Color(255, 226, 248, 235) : G::Color(255, 22, 62, 42); }
 }
 
 void RoundPath(G::GraphicsPath& p, const G::RectF& r, float rad) {
@@ -2001,6 +2848,14 @@ bool TaskbarIsLight() {
     return v != 0;
 }
 
+bool AppThemeIsLight() {
+    DWORD v = 0, size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &size) != ERROR_SUCCESS)
+        return false;
+    return v != 0;
+}
+
 class FlyoutHost {
 public:
     virtual ~FlyoutHost() = default;
@@ -2036,36 +2891,46 @@ public:
         MONITORINFO mi{};
         mi.cbSize = sizeof(mi);
         GetMonitorInfoW(mon, &mi);
-        const RECT work = mi.rcWork;
+        work_ = mi.rcWork;
 
+        theme::SetLight(AppThemeIsLight());
         BuildFonts();
         startup_ = host_.StartupEnabled();
         W_ = S(kWidth);
         hdrH_ = S(kHeaderH);
         ftrH_ = S(kFooterH);
+        anchor_ = anchor;
+        RefreshApps();
         Relayout();
-
-        const float maxH = std::min(S(kMaxHeight), static_cast<float>(work.bottom - work.top) - S(24));
-        H_ = std::clamp(hdrH_ + contentH_ + ftrH_, S(220), maxH);
-        viewportH_ = H_ - hdrH_ - ftrH_;
-        ClampScroll();
-        ComputeFooterRects();
-
-        const int w = static_cast<int>(std::lround(W_)), h = static_cast<int>(std::lround(H_));
-        const int margin = static_cast<int>(S(12));
-
-        const bool right = anchor.x > (work.left + work.right) / 2;
-        const bool bottom = anchor.y > (work.top + work.bottom) / 2;
-        const int x = right ? work.right - w - margin : work.left + margin;
-        const int y = bottom ? work.bottom - h - margin : work.top + margin;
+        FitWindow();
 
         DWORD round = 2;
-        DwmSetWindowAttribute(hwnd_, 33 , &round, sizeof(round));
-
-        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
-        SetForegroundWindow(hwnd_);
+        DwmSetWindowAttribute(hwnd_, 33, &round, sizeof(round));
+        SetTimer(hwnd_, kAppsTimer, 2500, nullptr);
+        SetTimer(hwnd_, kFirstFocusTimer, 320, nullptr);
+        TakeForeground();
         StartMascot();
         return true;
+    }
+
+    // Windows hanya memberi foreground ke proses yang sedang aktif. Saat
+    // flyout dibuka dari tray atau saat start, fokus itu perlu dipinjam dari
+    // thread jendela depan supaya flyout tidak tertutup sendiri.
+    void TakeForeground() {
+        HWND fg = GetForegroundWindow();
+        if (!fg || fg == hwnd_) {
+            SetForegroundWindow(hwnd_);
+            return;
+        }
+        const DWORD fgThread = GetWindowThreadProcessId(fg, nullptr);
+        const DWORD me = GetCurrentThreadId();
+        if (fgThread && fgThread != me && AttachThreadInput(me, fgThread, TRUE)) {
+            BringWindowToTop(hwnd_);
+            SetForegroundWindow(hwnd_);
+            AttachThreadInput(me, fgThread, FALSE);
+            return;
+        }
+        SetForegroundWindow(hwnd_);
     }
 
     void Refresh() {
@@ -2075,54 +2940,805 @@ public:
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
-private:
+    void OnSystemTheme() {
+        if (!hwnd_) return;
+        theme::SetLight(AppThemeIsLight());
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
 
-    static constexpr float kWidth = 392.f, kHeaderH = 84.f, kFooterH = 56.f, kMaxHeight = 640.f;
-    static constexpr UINT_PTR kAnimTimer = 1;
-    static constexpr float kSectionH = 32.f, kRowH = 82.f, kNoteH = 56.f, kCardMargin = 10.f;
+private:
+    static constexpr float kWidth = 424.f, kHeaderH = 96.f, kFooterH = 54.f, kMaxHeight = 720.f;
+    static constexpr UINT_PTR kAnimTimer = 1, kAppsTimer = 2, kFirstFocusTimer = 3;
+    static constexpr float kSectionH = 34.f, kRowH = 82.f, kNoteH = 58.f, kCardMargin = 8.f;
     static constexpr float kLockW = 88.f;
 
     float S(float v) const { return v * scale_; }
 
-    enum class Part { None, Lock, Mute, Slider, Startup, Quit, Mascot };
-    struct Hit { Part part = Part::None; int row = -1; };
+    enum class Screen { Dash, Mixer, Editor, Apps, Presets };
+    enum class Drag { None, Master, Rule, EditorTarget };
+
+    enum class Part {
+        None,
+        TabDash, TabMixer, Mascot, AddRule,
+        MasterLock, MasterSlider, MasterMute,
+        RuleToggle, RuleSim, RuleEdit, RuleDelete, RuleSlider,
+        RowLock, RowMute, RowSlider,
+        Startup, Quit,
+        EditorApps, EditorPreset, EditorManual, EditorSlider,
+        EditorModeMaster, EditorModeApp, EditorDelay, EditorRestore,
+        EditorMic, EditorAudio, EditorCancel, EditorSave, EditorDelete,
+        AppsRow, AppsManual, AppsPreset, AppsDone, AppsCancel,
+        PresetRow, PresetsCancel
+    };
+
+    struct Hit { Part part = Part::None; int index = -1; };
     struct Item {
-        enum Type { Section, RowItem, Note } type = Section;
+        enum Type { Status, Section, RuleCard, Note, LogHeader, LogEntry, RowItem } type = Section;
         std::wstring text;
-        int row = -1;
+        int index = -1;
         float y = 0.f, h = 0.f;
     };
-    struct RowRects { G::RectF card, icon, title, lock, status, mute, track, pct, sliderHit; };
+    struct RuleRects {
+        G::RectF card, icon, name, cond, toggle, track, pct, sliderHit, sim, edit, del, badge;
+    };
 
-    G::RectF MascotRect() const {
-        const float w = S(mascot::kDisplayW), h = w / mascot::kAspect;
-        return G::RectF(W_ - S(12) - w, hdrH_ - h, w, h);
-    }
+    struct EditorRects {
+        G::RectF appsCard, appsLabel, changeApps, presetBtn, manualBtn;
+        G::RectF targetCard, track, sliderHit, modeMaster, modeApp;
+        G::RectF delayCard, delay[5];
+        G::RectF restoreCard, restoreToggle;
+        G::RectF condCard, micChip, audioChip;
+        float contentH = 0.f;
+    };
 
-    void StartMascot() {
-        mascotImg_.reset(mascot::Load());
-        mascot_.t = static_cast<float>(GetTickCount64() % 7000) / 1000.f;
+    struct AppMapEntry {
+        std::wstring name;
+        HICON icon = nullptr;
+        bool audio = false;
+        bool mic = false;
+    };
 
-        BOOL anim = TRUE;
-        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
-        animate_ = (anim != FALSE);
-        if (animate_) {
-            lastTick_ = GetTickCount64();
-            SetTimer(hwnd_, kAnimTimer, 50, nullptr);
+    // ---------------------------------------------------------------- layout
+
+    void RefreshApps() {
+        apps_ = engine_.RunningApps();
+        appMap_.clear();
+        for (const AppInfo& info : apps_) {
+            AppMapEntry entry;
+            entry.name = info.name;
+            entry.icon = info.icon;
+            entry.audio = info.audio;
+            entry.mic = info.mic;
+            appMap_[util::Lower(info.exe)] = entry;
         }
     }
 
-    void TickMascot() {
-        const ULONGLONG now = GetTickCount64();
-
-        const float dt = std::min(0.1f, static_cast<float>(now - lastTick_) / 1000.f);
-        lastTick_ = now;
-        mascot::Step(mascot_, dt);
-
-        RECT area{static_cast<LONG>(W_ - S(mascot::kDisplayW + 40.f)), 0, static_cast<LONG>(std::ceil(W_)),
-                  static_cast<LONG>(std::ceil(hdrH_))};
-        InvalidateRect(hwnd_, &area, FALSE);
+    void Relayout() {
+        if (screen_ != Screen::Apps) rows_ = engine_.Snapshot();
+        items_.clear();
+        if (screen_ == Screen::Dash) { LayoutDashboard(); return; }
+        if (screen_ == Screen::Mixer) { LayoutMixer(); return; }
+        if (screen_ == Screen::Editor) { contentH_ = EditorLayout().contentH + S(6); return; }
+        if (screen_ == Screen::Apps) {
+            const float rows = static_cast<float>(apps_.size());
+            contentH_ = S(44) + rows * S(54) + S(8);
+            return;
+        }
+        contentH_ = S(8) + static_cast<float>(engine_.Presets().size()) * S(60) + S(8);
     }
+
+    const Rule* RuleAt(int index) const {
+        const std::vector<Rule>& list = engine_.Rules();
+        if (index < 0 || static_cast<size_t>(index) >= list.size()) return nullptr;
+        return &list[index];
+    }
+
+    std::wstring DisplayName(const std::wstring& exe) const {
+        auto it = appMap_.find(util::Lower(exe));
+        if (it != appMap_.end() && !it->second.name.empty()) return it->second.name;
+        std::wstring base = util::StripExtension(exe);
+        if (!base.empty()) base[0] = static_cast<wchar_t>(towupper(base[0]));
+        return base;
+    }
+
+    std::wstring SelectText(const Rule& rule) const {
+        if (rule.apps.empty()) return L"Belum ada aplikasi dipilih";
+        std::wstring out;
+        for (const std::wstring& app : rule.apps) {
+            if (!out.empty()) out += L", ";
+            out += DisplayName(app);
+        }
+        return out;
+    }
+
+    std::wstring ConditionText(const Rule& rule) const {
+        std::vector<std::wstring> parts;
+        if (rule.cond.mic) parts.push_back(L"mikrofon aktif");
+        if (rule.cond.audio) parts.push_back(L"audio keluar");
+        for (const std::wstring& p : rule.cond.processes) parts.push_back(p);
+        for (const std::wstring& t : rule.cond.titles) parts.push_back(L"judul \"" + t + L"\"");
+        if (parts.empty()) return L"Saat aplikasi memutar audio";
+        const wchar_t* glue = rule.cond.match == L"any" ? L" atau " : L" + ";
+        std::wstring out = L"Saat ";
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i) out += glue;
+            out += parts[i];
+        }
+        return out;
+    }
+
+    void LayoutDashboard() {
+        float y = S(6);
+        items_.push_back(Item{Item::Status, L"", -1, y, S(106)});
+        y += S(106) + S(8);
+
+        items_.push_back(Item{Item::Section, L"ATURAN OTOMATIS", -1, y, S(kSectionH)});
+        y += S(kSectionH);
+
+        const std::vector<Rule>& rules = engine_.Rules();
+        if (rules.empty()) {
+            items_.push_back(Item{Item::Note,
+                                  L"Belum ada aturan. Tambahkan aturan agar volume turun otomatis saat "
+                                  L"Discord, Zoom, atau aplikasi rapat lain masuk panggilan.",
+                                  -1, y, S(78)});
+            y += S(78);
+        } else {
+            for (size_t i = 0; i < rules.size(); ++i) {
+                items_.push_back(Item{Item::RuleCard, L"", static_cast<int>(i), y, S(112)});
+                y += S(112);
+            }
+        }
+
+        y += S(6);
+        items_.push_back(Item{Item::LogHeader, L"AKTIVITAS", -1, y, S(30)});
+        y += S(30);
+        const std::vector<LogEntry>& log = engine_.Log();
+        if (log.empty()) {
+            items_.push_back(Item{Item::Note, L"Belum ada aktivitas.", -1, y, S(24)});
+            y += S(24);
+        } else {
+            const size_t count = std::min<size_t>(log.size(), 12);
+            for (size_t i = 0; i < count; ++i) {
+                items_.push_back(Item{Item::LogEntry, L"", static_cast<int>(i), y, S(24)});
+                y += S(24);
+            }
+        }
+        // Sisakan ruang beberapa baris agar tinggi jendela tidak berubah-ubah
+        // setiap kali ada aktivitas baru masuk.
+        const size_t used = log.empty() ? 1 : std::min<size_t>(log.size(), 12);
+        for (size_t i = used; i < 4; ++i) {
+            items_.push_back(Item{Item::Note, L"", -1, y, S(24)});
+            y += S(24);
+        }
+        contentH_ = y + S(10);
+    }
+
+    void LayoutMixer() {
+        if (!engine_.Ready()) {
+            items_.push_back(Item{Item::Note, L"Layanan audio Windows belum tersedia. Mencoba lagi\u2026", -1, S(4), S(kNoteH)});
+            contentH_ = S(kNoteH) + S(12);
+            return;
+        }
+        float y = S(4);
+        struct Sec { Kind kind; const wchar_t* title; };
+        const Sec secs[] = {{Kind::Output, L"KELUARAN"}, {Kind::App, L"APLIKASI"}, {Kind::Input, L"MIKROFON"}};
+        for (const Sec& sec : secs) {
+            std::vector<int> idx;
+            for (size_t i = 0; i < rows_.size(); ++i) if (rows_[i].kind == sec.kind) idx.push_back(static_cast<int>(i));
+            if (idx.empty() && sec.kind != Kind::App) continue;
+            items_.push_back(Item{Item::Section, sec.title, -1, y, S(kSectionH)});
+            y += S(kSectionH);
+            if (idx.empty()) {
+                items_.push_back(Item{Item::Note, L"Belum ada aplikasi yang sedang memutar suara.", -1, y, S(kNoteH)});
+                y += S(kNoteH);
+            }
+            for (int i : idx) {
+                items_.push_back(Item{Item::RowItem, L"", i, y, S(kRowH)});
+                y += S(kRowH);
+            }
+        }
+        contentH_ = y + S(10);
+    }
+
+    EditorRects EditorLayout() const {
+        EditorRects r;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        float y = S(6);
+
+        r.appsCard = G::RectF(cx, y, cw, S(78));
+        r.appsLabel = G::RectF(cx + S(12), y + S(7), cw - S(24), S(16));
+        r.changeApps = G::RectF(cx + S(12), y + S(45), S(96), S(26));
+        r.presetBtn = G::RectF(cx + S(116), y + S(45), S(78), S(26));
+        r.manualBtn = G::RectF(cx + S(202), y + S(45), S(96), S(26));
+        y += S(78) + S(8);
+
+        r.targetCard = G::RectF(cx, y, cw, S(100));
+        r.track = G::RectF(cx + S(14), y + S(46), cw - S(28) - S(52), S(8));
+        r.sliderHit = G::RectF(cx + S(6), y + S(34), cw - S(12), S(32));
+        r.modeMaster = G::RectF(cx + S(12), y + S(70), S(104), S(24));
+        r.modeApp = G::RectF(cx + S(124), y + S(70), S(104), S(24));
+        y += S(100) + S(8);
+
+        r.delayCard = G::RectF(cx, y, cw, S(66));
+        const float chipW = (cw - S(24) - S(4) * 6) / 5.f;
+        for (int i = 0; i < 5; ++i)
+            r.delay[i] = G::RectF(cx + S(12) + static_cast<float>(i) * (chipW + S(6)), y + S(32), chipW, S(26));
+        y += S(66) + S(8);
+
+        r.restoreCard = G::RectF(cx, y, cw, S(48));
+        r.restoreToggle = G::RectF(cx + cw - S(12) - S(40), y + S(13), S(40), S(22));
+        y += S(48) + S(8);
+
+        r.condCard = G::RectF(cx, y, cw, S(86));
+        r.micChip = G::RectF(cx + S(12), y + S(30), S(120), S(26));
+        r.audioChip = G::RectF(cx + S(140), y + S(30), S(126), S(26));
+        y += S(86) + S(8);
+
+        r.contentH = y;
+        return r;
+    }
+
+    void FitWindow() {
+        const float maxH = std::min(S(kMaxHeight), static_cast<float>(work_.bottom - work_.top) - S(24));
+        H_ = std::clamp(hdrH_ + contentH_ + ftrH_, S(320), maxH);
+        viewportH_ = H_ - hdrH_ - ftrH_;
+        ClampScroll();
+        ComputeTabRects();
+        ComputeFooterRects();
+
+        int w = static_cast<int>(std::lround(W_));
+        int h = static_cast<int>(std::lround(H_));
+        const int margin = static_cast<int>(S(12));
+        const bool right = anchor_.x > (work_.left + work_.right) / 2;
+        const bool bottom = anchor_.y > (work_.top + work_.bottom) / 2;
+        const int x = right ? work_.right - w - margin : work_.left + margin;
+        const int y = bottom ? work_.bottom - h - margin : work_.top + margin;
+        SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+    }
+
+    void ClampScroll() {
+        const float maxScroll = std::max(0.f, contentH_ - viewportH_);
+        scroll_ = std::clamp(scroll_, 0.f, maxScroll);
+    }
+
+    void ComputeTabRects() {
+        const float y = hdrH_ - S(34);
+        tabDash_ = G::RectF(S(16), y, S(78), S(26));
+        tabMixer_ = G::RectF(S(100), y, S(78), S(26));
+    }
+
+    void ComputeFooterRects() {
+        const float top = H_ - ftrH_;
+        startupRect_ = G::RectF(S(12), top + S(10), S(250), S(36));
+        quitRect_ = G::RectF(W_ - S(12) - S(78), top + S(10), S(78), S(36));
+        cancelRect_ = G::RectF(S(12), top + S(10), S(92), S(34));
+        saveRect_ = G::RectF(W_ - S(12) - S(104), top + S(10), S(104), S(34));
+        deleteRect_ = G::RectF(W_ - S(12) - S(104) - S(8) - S(78), top + S(10), S(78), S(34));
+        doneRect_ = G::RectF(W_ - S(12) - S(96), top + S(10), S(96), S(34));
+    }
+
+    G::RectF MascotRect() const {
+        const float w = S(mascot::kDisplayW), h = w / mascot::kAspect;
+        return G::RectF(W_ - S(10) - w, hdrH_ - h, w, h);
+    }
+
+    G::RectF SectionAddRect(float iy) const {
+        return G::RectF(W_ - S(kCardMargin) - S(82), iy + S(4), S(82), S(26));
+    }
+
+    RuleRects RuleRectsFor(float iy) const {
+        RuleRects r;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        r.card = G::RectF(cx, iy, cw, S(106));
+        r.icon = G::RectF(cx + S(12), iy + S(12), S(26), S(26));
+        r.name = G::RectF(cx + S(48), iy + S(11), cw - S(48) - S(56), S(20));
+        r.cond = G::RectF(cx + S(48), iy + S(32), cw - S(48) - S(16), S(16));
+        r.toggle = G::RectF(cx + cw - S(12) - S(40), iy + S(12), S(40), S(22));
+        r.track = G::RectF(cx + S(14), iy + S(64), cw - S(28) - S(48), S(6));
+        r.pct = G::RectF(cx + cw - S(12) - S(44), iy + S(54), S(44), S(24));
+        r.sliderHit = G::RectF(cx + S(6), iy + S(52), cw - S(12), S(28));
+        r.sim = G::RectF(cx + S(12), iy + S(80), S(78), S(22));
+        r.edit = G::RectF(cx + S(96), iy + S(80), S(52), S(22));
+        r.del = G::RectF(cx + S(154), iy + S(80), S(56), S(22));
+        r.badge = G::RectF(cx + cw - S(12) - S(56), iy + S(78), S(56), S(22));
+        return r;
+    }
+
+    struct StatusRects {
+        G::RectF card, lock, track, sliderHit, mute;
+    };
+
+    StatusRects StatusRectsFor(float iy, bool locked) const {
+        StatusRects r;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        r.card = G::RectF(cx, iy, cw, S(104));
+        r.lock = G::RectF(cx + cw - S(12) - S(90), iy + S(10), S(90), S(28));
+        r.mute = G::RectF(cx + S(10), iy + S(46), S(28), S(28));
+        r.track = G::RectF(cx + S(44), iy + S(58), cw - S(44) - S(14) - S(46), S(6));
+        r.sliderHit = G::RectF(cx + S(36), iy + S(46), cw - S(36) - S(14) - S(46), S(28));
+        (void)locked;
+        return r;
+    }
+
+    // ------------------------------------------------------------- hit test
+
+    Hit HitTest(float x, float y) const {
+        if (y < hdrH_) {
+            if (MascotRect().Contains(x, y)) return Hit{Part::Mascot, -1};
+            if (screen_ == Screen::Dash || screen_ == Screen::Mixer) {
+                if (tabDash_.Contains(x, y)) return Hit{Part::TabDash, -1};
+                if (tabMixer_.Contains(x, y)) return Hit{Part::TabMixer, -1};
+            }
+            return Hit{};
+        }
+        if (y >= H_ - ftrH_) {
+            switch (screen_) {
+                case Screen::Editor:
+                    if (cancelRect_.Contains(x, y)) return Hit{Part::EditorCancel, -1};
+                    if (saveRect_.Contains(x, y)) return Hit{Part::EditorSave, -1};
+                    if (!editor_.isNew && deleteRect_.Contains(x, y)) return Hit{Part::EditorDelete, -1};
+                    return Hit{};
+                case Screen::Apps:
+                    if (cancelRect_.Contains(x, y)) return Hit{Part::AppsCancel, -1};
+                    if (doneRect_.Contains(x, y)) return Hit{Part::AppsDone, -1};
+                    return Hit{};
+                case Screen::Presets:
+                    if (cancelRect_.Contains(x, y)) return Hit{Part::PresetsCancel, -1};
+                    return Hit{};
+                default:
+                    if (startupRect_.Contains(x, y)) return Hit{Part::Startup, -1};
+                    if (quitRect_.Contains(x, y)) return Hit{Part::Quit, -1};
+                    return Hit{};
+            }
+        }
+        if (screen_ == Screen::Editor) return HitTestEditor(x, y);
+        if (screen_ == Screen::Apps) return HitTestApps(x, y);
+        if (screen_ == Screen::Presets) return HitTestPresets(x, y);
+
+        for (const Item& it : items_) {
+            const float iy = hdrH_ + it.y - scroll_;
+            if (y < iy || y >= iy + it.h) continue;
+            if (it.type == Item::Status) {
+                const MasterInfo master = engine_.Master();
+                const StatusRects rc = StatusRectsFor(iy, master.locked);
+                if (rc.lock.Contains(x, y)) return Hit{Part::MasterLock, -1};
+                if (rc.mute.Contains(x, y)) return Hit{Part::MasterMute, -1};
+                if (!master.locked && rc.sliderHit.Contains(x, y)) return Hit{Part::MasterSlider, -1};
+                return Hit{};
+            }
+            if (it.type == Item::Section) {
+                if (it.text == L"ATURAN OTOMATIS" && SectionAddRect(iy).Contains(x, y)) return Hit{Part::AddRule, -1};
+                return Hit{};
+            }
+            if (it.type == Item::RuleCard) {
+                const RuleRects rc = RuleRectsFor(iy);
+                if (rc.toggle.Contains(x, y)) return Hit{Part::RuleToggle, it.index};
+                if (rc.sliderHit.Contains(x, y)) return Hit{Part::RuleSlider, it.index};
+                if (rc.sim.Contains(x, y)) return Hit{Part::RuleSim, it.index};
+                if (rc.edit.Contains(x, y)) return Hit{Part::RuleEdit, it.index};
+                if (rc.del.Contains(x, y)) return Hit{Part::RuleDelete, it.index};
+                return Hit{};
+            }
+            if (it.type == Item::RowItem) {
+                const RowRects rc = RowRectsFor(iy);
+                const Row& r = rows_[it.index];
+                if (rc.lock.Contains(x, y)) return Hit{Part::RowLock, it.index};
+                if (rc.mute.Contains(x, y)) return Hit{Part::RowMute, it.index};
+                if (!r.locked && r.live && rc.sliderHit.Contains(x, y)) return Hit{Part::RowSlider, it.index};
+                return Hit{};
+            }
+            return Hit{};
+        }
+        return Hit{};
+    }
+
+    Hit HitTestEditor(float x, float y) const {
+        const EditorRects rc = EditorLayout();
+        const float oy = hdrH_ - scroll_;
+        auto at = [&](const G::RectF& r) {
+            G::RectF s(r.X, r.Y + oy, r.Width, r.Height);
+            return s.Contains(x, y);
+        };
+        if (at(rc.changeApps)) return Hit{Part::EditorApps, -1};
+        if (at(rc.presetBtn)) return Hit{Part::EditorPreset, -1};
+        if (at(rc.manualBtn)) return Hit{Part::EditorManual, -1};
+        if (at(rc.sliderHit)) return Hit{Part::EditorSlider, -1};
+        if (at(rc.modeMaster)) return Hit{Part::EditorModeMaster, -1};
+        if (at(rc.modeApp)) return Hit{Part::EditorModeApp, -1};
+        for (int i = 0; i < 5; ++i) if (at(rc.delay[i])) return Hit{Part::EditorDelay, i};
+        if (at(rc.restoreToggle)) return Hit{Part::EditorRestore, -1};
+        if (at(rc.micChip)) return Hit{Part::EditorMic, -1};
+        if (at(rc.audioChip)) return Hit{Part::EditorAudio, -1};
+        return Hit{};
+    }
+
+    Hit HitTestApps(float x, float y) const {
+        const float oy = hdrH_ - scroll_;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        const G::RectF manual(cx, S(6) + oy, S(140), S(30));
+        const G::RectF preset(cx + S(148), S(6) + oy, S(140), S(30));
+        if (manual.Contains(x, y)) return Hit{Part::AppsManual, -1};
+        if (preset.Contains(x, y)) return Hit{Part::AppsPreset, -1};
+        for (size_t i = 0; i < apps_.size(); ++i) {
+            const G::RectF row(cx, S(44) + oy + static_cast<float>(i) * S(54), cw, S(48));
+            if (row.Contains(x, y)) return Hit{Part::AppsRow, static_cast<int>(i)};
+        }
+        return Hit{};
+    }
+
+    Hit HitTestPresets(float x, float y) const {
+        const float oy = hdrH_ - scroll_;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        const std::vector<Preset>& list = engine_.Presets();
+        for (size_t i = 0; i < list.size(); ++i) {
+            const G::RectF row(cx, S(8) + oy + static_cast<float>(i) * S(60), cw, S(54));
+            if (row.Contains(x, y)) return Hit{Part::PresetRow, static_cast<int>(i)};
+        }
+        return Hit{};
+    }
+
+    struct RowRects { G::RectF card, icon, title, lock, status, mute, track, pct, sliderHit; };
+
+    RowRects RowRectsFor(float iy) const {
+        RowRects r;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        const float cy = iy + S(3), ch = S(kRowH - 6.f);
+        r.card = G::RectF(cx, cy, cw, ch);
+        r.icon = G::RectF(cx + S(12), cy + S(10), S(24), S(24));
+        r.lock = G::RectF(cx + cw - S(12) - S(kLockW), cy + S(9), S(kLockW), S(26));
+        r.title = G::RectF(cx + S(46), cy + S(8), r.lock.X - S(8) - (cx + S(46)), S(26));
+        r.status = G::RectF(cx + S(46), cy + S(34), cw - S(46) - S(12), S(16));
+        r.mute = G::RectF(cx + S(10), cy + S(50), S(24), S(24));
+        const float trackL = cx + S(44), trackR = cx + cw - S(12) - S(42);
+        r.track = G::RectF(trackL, cy + S(59), trackR - trackL, S(6));
+        r.pct = G::RectF(trackR + S(6), cy + S(50), S(36), S(24));
+        r.sliderHit = G::RectF(trackL - S(10), cy + S(50), (trackR - trackL) + S(20), S(24));
+        return r;
+    }
+
+    // ------------------------------------------------------------ interaction
+
+    void SetHot(const Hit& h) {
+        if (h.part == hot_.part && h.index == hot_.index) return;
+        hot_ = h;
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void OnMouseMove(int x, int y) {
+        if (!tracking_) {
+            TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd_, 0};
+            TrackMouseEvent(&t);
+            tracking_ = true;
+        }
+        if (drag_ != Drag::None) { ApplyDrag(static_cast<float>(x)); return; }
+        SetHot(HitTest(static_cast<float>(x), static_cast<float>(y)));
+    }
+
+    bool DraggableSlider(const Hit& h) const {
+        switch (h.part) {
+            case Part::MasterSlider: return true;
+            case Part::RuleSlider: return RuleAt(h.index) != nullptr;
+            case Part::RowSlider: return true;
+            case Part::EditorSlider: return true;
+            default: return false;
+        }
+    }
+
+    void OnLButtonDown(int x, int y) {
+        const Hit h = HitTest(static_cast<float>(x), static_cast<float>(y));
+        pressed_ = h;
+        if (!DraggableSlider(h)) return;
+        dragging_ = true;
+        switch (h.part) {
+            case Part::MasterSlider: {
+                drag_ = Drag::Master;
+                dragKind_ = Kind::Output;
+                const MasterInfo master = engine_.Master();
+                dragKey_ = master.key;
+                dragTrack_ = StatusRectsFor(hdrH_ + 6.f - scroll_, master.locked).track;
+                break;
+            }
+            case Part::RuleSlider: {
+                drag_ = Drag::Rule;
+                dragIndex_ = h.index;
+                for (const Item& it : items_) {
+                    if (it.type == Item::RuleCard && it.index == h.index) {
+                        dragTrack_ = RuleRectsFor(hdrH_ + it.y - scroll_).track;
+                        break;
+                    }
+                }
+                break;
+            }
+            case Part::RowSlider: {
+                drag_ = Drag::Master;
+                dragKind_ = rows_[h.index].kind;
+                dragKey_ = rows_[h.index].key;
+                for (const Item& it : items_) {
+                    if (it.type == Item::RowItem && it.index == h.index) {
+                        dragTrack_ = RowRectsFor(hdrH_ + it.y - scroll_).track;
+                        break;
+                    }
+                }
+                break;
+            }
+            case Part::EditorSlider:
+                drag_ = Drag::EditorTarget;
+                dragTrack_ = EditorLayout().track;
+                dragTrack_.Y -= scroll_;
+                break;
+            default: break;
+        }
+        SetCapture(hwnd_);
+        ApplyDrag(static_cast<float>(x));
+    }
+
+    void OnLButtonUp(int x, int y) {
+        if (dragging_) {
+            dragging_ = false;
+            if (drag_ == Drag::Rule) {
+                const Rule* rule = RuleAt(dragIndex_);
+                if (rule) engine_.SetRuleTarget(rule->id, rule->target, true);
+            }
+            drag_ = Drag::None;
+            ReleaseCapture();
+            Refresh();
+            return;
+        }
+        const Hit h = HitTest(static_cast<float>(x), static_cast<float>(y));
+        const Hit down = pressed_;
+        pressed_ = Hit{};
+        if (h.part == Part::None || h.part != down.part || h.index != down.index) return;
+        Activate(h);
+    }
+
+    void Activate(const Hit& h) {
+        switch (h.part) {
+            case Part::TabDash: SetScreen(Screen::Dash); break;
+            case Part::TabMixer: SetScreen(Screen::Mixer); break;
+            case Part::AddRule: BeginNewRule(); break;
+            case Part::Mascot:
+                if (mascot_.bounce < 0.f) { mascot_.bounce = 0.f; mascot_.heart = 0.f; }
+                break;
+            case Part::MasterLock: {
+                const MasterInfo master = engine_.Master();
+                if (!master.key.empty()) engine_.ToggleLock(Kind::Output, master.key);
+                Refresh();
+                break;
+            }
+            case Part::MasterMute: {
+                const MasterInfo master = engine_.Master();
+                if (master.live && !master.locked) engine_.SetMuted(Kind::Output, master.key, !master.now.muted);
+                Refresh();
+                break;
+            }
+            case Part::RuleToggle: {
+                if (const Rule* rule = RuleAt(h.index)) engine_.SetRuleEnabled(rule->id, !rule->enabled);
+                Refresh();
+                break;
+            }
+            case Part::RuleSim:
+                if (const Rule* rule = RuleAt(h.index)) engine_.SimulateRule(rule->id);
+                Refresh();
+                break;
+            case Part::RuleEdit: OpenEditor(h.index); break;
+            case Part::RuleDelete:
+                if (const Rule* rule = RuleAt(h.index)) DeleteRule(rule->id, rule->name);
+                break;
+            case Part::RowLock:
+                engine_.ToggleLock(rows_[h.index].kind, rows_[h.index].key);
+                Refresh();
+                break;
+            case Part::RowMute: {
+                const Row& r = rows_[h.index];
+                if (r.locked || !r.live) break;
+                engine_.SetMuted(r.kind, r.key, !r.now.muted);
+                Refresh();
+                break;
+            }
+            case Part::Startup:
+                host_.SetStartup(!startup_);
+                startup_ = host_.StartupEnabled();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                break;
+            case Part::Quit: host_.RequestQuit(); break;
+            case Part::EditorApps:
+                pickerForNew_ = false;
+                RefreshApps();
+                SetScreen(Screen::Apps);
+                break;
+            case Part::EditorPreset: SetScreen(Screen::Presets); break;
+            case Part::EditorManual: PickManualExe(); break;
+            case Part::EditorModeMaster: editor_.draft.useMaster = true; InvalidateRect(hwnd_, nullptr, FALSE); break;
+            case Part::EditorModeApp: editor_.draft.useMaster = false; InvalidateRect(hwnd_, nullptr, FALSE); break;
+            case Part::EditorDelay:
+                if (h.index >= 0 && h.index < 5) {
+                    const int values[5] = {1000, 2000, 3000, 5000, 10000};
+                    editor_.draft.delayMs = values[h.index];
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                }
+                break;
+            case Part::EditorRestore:
+                editor_.draft.restore = !editor_.draft.restore;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                break;
+            case Part::EditorMic:
+                editor_.draft.cond.mic = !editor_.draft.cond.mic;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                break;
+            case Part::EditorAudio:
+                editor_.draft.cond.audio = !editor_.draft.cond.audio;
+                InvalidateRect(hwnd_, nullptr, FALSE);
+                break;
+            case Part::EditorCancel:
+                editor_ = Editor{};
+                SetScreen(Screen::Dash);
+                break;
+            case Part::EditorSave: SaveDraft(); break;
+            case Part::EditorDelete:
+                DeleteRule(editor_.draft.id, editor_.draft.name);
+                break;
+            case Part::AppsRow:
+                if (h.index >= 0 && static_cast<size_t>(h.index) < apps_.size())
+                    ToggleDraftApp(apps_[h.index].exe);
+                break;
+            case Part::AppsManual: PickManualExe(); break;
+            case Part::AppsPreset: SetScreen(Screen::Presets); break;
+            case Part::AppsDone:
+                if (editor_.draft.apps.empty()) break;
+                SetScreen(Screen::Editor);
+                break;
+            case Part::AppsCancel: BackFromEditor(); break;
+            case Part::PresetRow: ApplyPreset(h.index); break;
+            case Part::PresetsCancel:
+                SetScreen(editor_.isNew && editor_.draft.apps.empty() ? Screen::Apps : Screen::Editor);
+                break;
+            default: break;
+        }
+    }
+
+    void ApplyDrag(float x) {
+        if (drag_ == Drag::None || dragTrack_.Width <= 0.f) return;
+        float level = (x - dragTrack_.X) / dragTrack_.Width;
+        level = std::clamp(std::round(level * 100.f) / 100.f, 0.f, 1.f);
+        switch (drag_) {
+            case Drag::Master:
+                engine_.SetLevel(dragKind_, dragKey_, level);
+                break;
+            case Drag::Rule:
+                if (const Rule* rule = RuleAt(dragIndex_)) engine_.SetRuleTarget(rule->id, level, false);
+                break;
+            case Drag::EditorTarget:
+                editor_.draft.target = level;
+                break;
+            default: break;
+        }
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    // --------------------------------------------------------------- screens
+
+    void SetScreen(Screen screen) {
+        if (screen_ == screen) return;
+        screen_ = screen;
+        scroll_ = 0.f;
+        hot_ = Hit{};
+        pressed_ = Hit{};
+        if (screen == Screen::Apps) RefreshApps();
+        Relayout();
+        FitWindow();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void BeginNewRule() {
+        editor_ = Editor{};
+        editor_.open = true;
+        editor_.isNew = true;
+        editor_.draft.id.clear();
+        editor_.draft.enabled = true;
+        editor_.draft.target = 0.20f;
+        editor_.draft.delayMs = 3000;
+        editor_.draft.restore = true;
+        editor_.draft.useMaster = true;
+        editor_.draft.cond.mic = true;
+        editor_.draft.cond.audio = true;
+        editor_.draft.cond.match = L"all";
+        pickerForNew_ = true;
+        RefreshApps();
+        SetScreen(Screen::Apps);
+    }
+
+    void OpenEditor(int index) {
+        const Rule* rule = RuleAt(index);
+        if (!rule) return;
+        editor_ = Editor{};
+        editor_.open = true;
+        editor_.isNew = false;
+        editor_.draft = *rule;
+        pickerForNew_ = false;
+        SetScreen(Screen::Editor);
+    }
+
+    void BackFromEditor() {
+        if (editor_.isNew) SetScreen(Screen::Dash);
+        else SetScreen(Screen::Editor);
+    }
+
+    void ToggleDraftApp(const std::wstring& exe) {
+        const std::wstring key = util::Lower(exe);
+        auto it = std::find(editor_.draft.apps.begin(), editor_.draft.apps.end(), key);
+        if (it != editor_.draft.apps.end()) editor_.draft.apps.erase(it);
+        else editor_.draft.apps.push_back(key);
+
+        if (editor_.draft.name.empty() && !editor_.draft.apps.empty())
+            editor_.draft.name = DisplayName(editor_.draft.apps.front());
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    void PickManualExe() {
+        wchar_t buf[MAX_PATH] = L"";
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd_;
+        ofn.lpstrFilter = L"Program (*.exe)\0*.exe\0Semua berkas\0*.*\0";
+        ofn.lpstrFile = buf;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        modal_ = true;
+        const BOOL ok = GetOpenFileNameW(&ofn);
+        modal_ = false;
+        SetForegroundWindow(hwnd_);
+        if (!ok || !buf[0]) return;
+
+        const AppInfo info = engine_.DescribePath(buf);
+        ToggleDraftApp(info.exe);
+        if (editor_.draft.name.empty()) editor_.draft.name = info.name;
+        RefreshApps();
+    }
+
+    void ApplyPreset(int index) {
+        const std::vector<Preset>& list = engine_.Presets();
+        if (index < 0 || static_cast<size_t>(index) >= list.size()) return;
+        const Preset& preset = list[index];
+        if (!editor_.open) BeginNewRule();
+        editor_.draft.apps = preset.apps;
+        editor_.draft.preset = preset.id;
+        editor_.draft.name = preset.name;
+        editor_.draft.target = preset.target;
+        editor_.draft.delayMs = preset.delayMs;
+        editor_.draft.restore = preset.restore;
+        editor_.draft.useMaster = preset.useMaster;
+        editor_.draft.cond = preset.cond;
+        editor_.draft.enabled = true;
+        pickerForNew_ = false;
+        SetScreen(Screen::Editor);
+    }
+
+    void SaveDraft() {
+        if (editor_.draft.apps.empty()) return;
+        Rule draft = editor_.draft;
+        if (draft.name.empty()) draft.name = DisplayName(draft.apps.front());
+        engine_.SaveRule(std::move(draft), editor_.isNew);
+        editor_ = Editor{};
+        SetScreen(Screen::Dash);
+    }
+
+    void DeleteRule(const std::wstring& id, const std::wstring& name) {
+        modal_ = true;
+        const int answer = MessageBoxW(hwnd_, (L"Hapus aturan \"" + name + L"\"?").c_str(), L"Hub Volume",
+                                       MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
+        modal_ = false;
+        SetForegroundWindow(hwnd_);
+        if (answer != IDYES) return;
+        engine_.DeleteRule(id);
+        if (screen_ == Screen::Editor) {
+            editor_ = Editor{};
+            SetScreen(Screen::Dash);
+        } else {
+            Refresh();
+        }
+    }
+
+    // ------------------------------------------------------------ messages
 
     void RegisterClassOnce() {
         static bool done = false;
@@ -2155,19 +3771,49 @@ private:
             case WM_ERASEBKGND: return 1;
             case WM_PAINT: OnPaint(); return 0;
             case WM_ACTIVATE:
-
-                if (LOWORD(wp) == WA_INACTIVE) host_.RequestHide();
+                if (LOWORD(wp) == WA_INACTIVE) {
+                    // Jangan langsung menutup bila jendela belum pernah mendapat
+                    // fokus: Windows kadang menolak foreground saat aplikasi baru
+                    // dijalankan sehingga flyout tampak tidak muncul.
+                    if (wasActive_ && !modal_) host_.RequestHide();
+                } else {
+                    wasActive_ = true;
+                }
                 return 0;
             case WM_KEYDOWN:
-                if (wp == VK_ESCAPE) host_.RequestHide();
+                if (wp == VK_ESCAPE) {
+                    if (screen_ == Screen::Editor) {
+                        editor_ = Editor{};
+                        SetScreen(Screen::Dash);
+                    } else if (screen_ == Screen::Apps) {
+                        BackFromEditor();
+                    } else if (screen_ == Screen::Presets) {
+                        SetScreen(editor_.isNew && editor_.draft.apps.empty() ? Screen::Apps : Screen::Editor);
+                    } else {
+                        host_.RequestHide();
+                    }
+                }
                 return 0;
             case WM_MOUSEMOVE: OnMouseMove(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
             case WM_MOUSELEAVE: tracking_ = false; SetHot(Hit{}); return 0;
             case WM_LBUTTONDOWN: OnLButtonDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
             case WM_LBUTTONUP: OnLButtonUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
-            case WM_CAPTURECHANGED: dragging_ = false; return 0;
+            case WM_CAPTURECHANGED: dragging_ = false; drag_ = Drag::None; return 0;
             case WM_TIMER:
                 if (wp == kAnimTimer) TickMascot();
+                else if (wp == kAppsTimer) {
+                    RefreshApps();
+                    Relayout();
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                } else if (wp == kFirstFocusTimer) {
+                    KillTimer(hwnd_, kFirstFocusTimer);
+                    if (!wasActive_) {
+                        if (GetForegroundWindow() != hwnd_) TakeForeground();
+                        // Tetap tidak dapat fokus: tutup saja daripada
+                        // meninggalkan jendela yang tidak bisa ditutup.
+                        if (!wasActive_ && GetForegroundWindow() != hwnd_) host_.RequestHide();
+                    }
+                }
                 return 0;
             case WM_MOUSEWHEEL: {
                 scroll_ -= static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / 120.f * S(48);
@@ -2180,21 +3826,27 @@ private:
                     POINT p;
                     GetCursorPos(&p);
                     ScreenToClient(hwnd_, &p);
-                    Hit h = HitTest(static_cast<float>(p.x), static_cast<float>(p.y));
-                    bool hand = h.part != Part::None;
-                    if (h.part == Part::Slider && h.row >= 0 && (rows_[h.row].locked || !rows_[h.row].live)) hand = false;
+                    const Hit h = HitTest(static_cast<float>(p.x), static_cast<float>(p.y));
+                    bool hand = h.part != Part::None && h.part != Part::Mascot;
+                    if (DraggableSlider(h)) {
+                        hand = false;
+                        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                        return TRUE;
+                    }
                     SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
                     return TRUE;
                 }
                 break;
             case WM_DESTROY:
-
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                KillTimer(hwnd_, kFirstFocusTimer);
+                SetWindowLongPtrW(hwnd_, GWLP_USERDATA, 0);
                 hwnd_ = nullptr;
                 return 0;
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
+
+    // -------------------------------------------------------------- painting
 
     void BuildFonts() {
         family_ = std::make_unique<G::FontFamily>(L"Segoe UI");
@@ -2203,10 +3855,13 @@ private:
             return std::make_unique<G::Font>(family_.get(), px * scale_, style, G::UnitPixel);
         };
         fTitle_ = mk(18, G::FontStyleBold);
+        fH2_ = mk(15, G::FontStyleBold);
+        fBig_ = mk(23, G::FontStyleBold);
         fRow_ = mk(13, G::FontStyleRegular);
         fBtn_ = mk(12, G::FontStyleBold);
         fSmall_ = mk(11, G::FontStyleRegular);
         fPct_ = mk(12, G::FontStyleRegular);
+        fTiny_ = mk(10, G::FontStyleBold);
         fSection_ = mk(11, G::FontStyleBold);
         auto fmt = [&](G::StringAlignment align) {
             auto f = std::make_unique<G::StringFormat>(G::StringFormatFlagsNoWrap);
@@ -2218,174 +3873,34 @@ private:
         fmtL_ = fmt(G::StringAlignmentNear);
         fmtR_ = fmt(G::StringAlignmentFar);
         fmtC_ = fmt(G::StringAlignmentCenter);
+        auto wrap = std::make_unique<G::StringFormat>();
+        wrap->SetAlignment(G::StringAlignmentNear);
+        wrap->SetLineAlignment(G::StringAlignmentNear);
+        wrap->SetTrimming(G::StringTrimmingEllipsisWord);
+        fmtWrap_ = std::move(wrap);
     }
 
-    void Relayout() {
-        rows_ = engine_.Snapshot();
-        items_.clear();
-        if (!engine_.Ready()) {
-            items_.push_back(Item{Item::Note, L"Layanan audio Windows belum tersedia. Mencoba lagi\u2026", -1, S(4), S(kNoteH)});
-            contentH_ = S(kNoteH) + S(12);
-            return;
-        }
-        float y = S(4);
-        struct Sec { Kind kind; const wchar_t* title; };
-        const Sec secs[] = {{Kind::Output, L"KELUARAN"}, {Kind::App, L"APLIKASI"}, {Kind::Input, L"MIKROFON"}};
-        for (const Sec& sec : secs) {
-            std::vector<int> idx;
-            for (size_t i = 0; i < rows_.size(); ++i) if (rows_[i].kind == sec.kind) idx.push_back(static_cast<int>(i));
-            if (idx.empty() && sec.kind != Kind::App) continue;
-            items_.push_back(Item{Item::Section, sec.title, -1, y, S(kSectionH)});
-            y += S(kSectionH);
-            if (idx.empty()) {
-                items_.push_back(Item{Item::Note, L"Belum ada aplikasi yang sedang memutar suara.", -1, y, S(kNoteH)});
-                y += S(kNoteH);
-            }
-            for (int i : idx) {
-                items_.push_back(Item{Item::RowItem, L"", i, y, S(kRowH)});
-                y += S(kRowH);
-            }
-        }
-        contentH_ = y + S(8);
-    }
+    void StartMascot() {
+        mascotImg_.reset(mascot::Load());
+        mascot_.t = static_cast<float>(GetTickCount64() % 7000) / 1000.f;
 
-    void ClampScroll() {
-        const float maxScroll = std::max(0.f, contentH_ - viewportH_);
-        scroll_ = std::clamp(scroll_, 0.f, maxScroll);
-    }
-
-    void ComputeFooterRects() {
-        const float top = H_ - ftrH_;
-        startupRect_ = G::RectF(S(12), top + S(10), S(250), S(36));
-        quitRect_ = G::RectF(W_ - S(12) - S(76), top + S(10), S(76), S(36));
-    }
-
-    RowRects RectsFor(float iy) const {
-        RowRects r;
-        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
-        const float cy = iy + S(3), ch = S(kRowH - 6.f);
-        r.card = G::RectF(cx, cy, cw, ch);
-        r.icon = G::RectF(cx + S(12), cy + S(10), S(24), S(24));
-        r.lock = G::RectF(cx + cw - S(12) - S(kLockW), cy + S(9), S(kLockW), S(26));
-        r.title = G::RectF(cx + S(46), cy + S(8), r.lock.X - S(8) - (cx + S(46)), S(26));
-        r.status = G::RectF(cx + S(46), cy + S(34), cw - S(46) - S(12), S(16));
-        r.mute = G::RectF(cx + S(10), cy + S(50), S(24), S(24));
-        const float trackL = cx + S(44), trackR = cx + cw - S(12) - S(42);
-        r.track = G::RectF(trackL, cy + S(59), trackR - trackL, S(6));
-        r.pct = G::RectF(trackR + S(6), cy + S(50), S(36), S(24));
-        r.sliderHit = G::RectF(trackL - S(10), cy + S(50), (trackR - trackL) + S(20), S(24));
-        return r;
-    }
-
-    Hit HitTest(float x, float y) const {
-        if (y >= H_ - ftrH_) {
-            if (startupRect_.Contains(x, y)) return Hit{Part::Startup, -1};
-            if (quitRect_.Contains(x, y)) return Hit{Part::Quit, -1};
-            return Hit{};
-        }
-        if (y < hdrH_) return MascotRect().Contains(x, y) ? Hit{Part::Mascot, -1} : Hit{};
-        for (const Item& it : items_) {
-            if (it.type != Item::RowItem) continue;
-            const float iy = hdrH_ + it.y - scroll_;
-            if (y < iy || y >= iy + it.h) continue;
-            const RowRects rc = RectsFor(iy);
-            if (rc.lock.Contains(x, y)) return Hit{Part::Lock, it.row};
-            if (rc.mute.Contains(x, y)) return Hit{Part::Mute, it.row};
-            if (rc.sliderHit.Contains(x, y)) return Hit{Part::Slider, it.row};
-            return Hit{Part::None, it.row};
-        }
-        return Hit{};
-    }
-
-    void SetHot(const Hit& h) {
-        if (h.part == hot_.part && h.row == hot_.row) return;
-        hot_ = h;
-        InvalidateRect(hwnd_, nullptr, FALSE);
-    }
-
-    void OnMouseMove(int x, int y) {
-        if (!tracking_) {
-            TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd_, 0};
-            TrackMouseEvent(&t);
-            tracking_ = true;
-        }
-        if (dragging_) { ApplyDrag(static_cast<float>(x)); return; }
-        SetHot(HitTest(static_cast<float>(x), static_cast<float>(y)));
-    }
-
-    void OnLButtonDown(int x, int y) {
-        const Hit h = HitTest(static_cast<float>(x), static_cast<float>(y));
-        pressed_ = h;
-        if (h.part == Part::Slider && h.row >= 0) {
-            const Row& r = rows_[h.row];
-            if (r.locked || !r.live) return;
-            dragging_ = true;
-            dragKind_ = r.kind;
-            dragKey_ = r.key;
-            SetCapture(hwnd_);
-            ApplyDrag(static_cast<float>(x));
+        BOOL anim = TRUE;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0);
+        animate_ = (anim != FALSE);
+        if (animate_) {
+            lastTick_ = GetTickCount64();
+            SetTimer(hwnd_, kAnimTimer, 50, nullptr);
         }
     }
 
-    void OnLButtonUp(int x, int y) {
-        if (dragging_) {
-            dragging_ = false;
-            ReleaseCapture();
-            return;
-        }
-        const Hit h = HitTest(static_cast<float>(x), static_cast<float>(y));
-        const Hit down = pressed_;
-        pressed_ = Hit{};
-        if (h.part == Part::None || h.part != down.part || h.row != down.row) return;
-
-        switch (h.part) {
-            case Part::Lock: {
-
-                const Kind kind = rows_[h.row].kind;
-                const std::wstring key = rows_[h.row].key;
-                engine_.ToggleLock(kind, key);
-                Refresh();
-                break;
-            }
-            case Part::Mute: {
-                const Kind kind = rows_[h.row].kind;
-                const std::wstring key = rows_[h.row].key;
-                const bool muted = rows_[h.row].now.muted;
-                if (rows_[h.row].locked || !rows_[h.row].live) break;
-                engine_.SetMuted(kind, key, !muted);
-                Refresh();
-                break;
-            }
-            case Part::Startup:
-                host_.SetStartup(!startup_);
-                startup_ = host_.StartupEnabled();
-                InvalidateRect(hwnd_, nullptr, FALSE);
-                break;
-            case Part::Quit: host_.RequestQuit(); break;
-            case Part::Mascot:
-
-                if (mascot_.bounce < 0.f) { mascot_.bounce = 0.f; mascot_.heart = 0.f; }
-                break;
-            default: break;
-        }
-    }
-
-    void ApplyDrag(float x) {
-
-        for (const Item& it : items_) {
-            if (it.type != Item::RowItem) continue;
-            Row& r = rows_[it.row];
-            if (r.kind != dragKind_ || r.key != dragKey_) continue;
-            const RowRects rc = RectsFor(hdrH_ + it.y - scroll_);
-            float level = (x - rc.track.X) / rc.track.Width;
-            level = std::clamp(std::round(level * 100.f) / 100.f, 0.f, 1.f);
-            engine_.SetLevel(r.kind, r.key, level);
-            r.now.level = level;
-            InvalidateRect(hwnd_, nullptr, FALSE);
-            return;
-        }
-        dragging_ = false;
-        ReleaseCapture();
+    void TickMascot() {
+        const ULONGLONG now = GetTickCount64();
+        const float dt = std::min(0.1f, static_cast<float>(now - lastTick_) / 1000.f);
+        lastTick_ = now;
+        mascot::Step(mascot_, dt);
+        RECT area{static_cast<LONG>(W_ - S(mascot::kDisplayW + 40.f)), 0, static_cast<LONG>(std::ceil(W_)),
+                  static_cast<LONG>(std::ceil(hdrH_))};
+        InvalidateRect(hwnd_, &area, FALSE);
     }
 
     void OnPaint() {
@@ -2398,7 +3913,6 @@ private:
         RECT d = ps.rcPaint;
         IntersectRect(&d, &d, &rc);
         if (w > 0 && h > 0 && d.right > d.left && d.bottom > d.top) {
-
             HDC mem = CreateCompatibleDC(hdc);
             HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
             HGDIOBJ old = SelectObject(mem, bmp);
@@ -2423,7 +3937,336 @@ private:
         g.DrawString(s.c_str(), static_cast<INT>(s.size()), &f, r, &fmt, &b);
     }
 
-    static std::wstring Percent(float level) { return std::to_wstring(static_cast<int>(std::lround(level * 100.f))) + L"%"; }
+    void TextLeft(G::Graphics& g, const std::wstring& s, const G::Font& f, const G::Color& c, const G::RectF& r) {
+        Text(g, s, f, c, r, *fmtL_);
+    }
+
+    static std::wstring Percent(float level) {
+        return std::to_wstring(static_cast<int>(std::lround(level * 100.f))) + L"%";
+    }
+
+    void Pill(G::Graphics& g, const G::RectF& r, const std::wstring& label, bool active, bool hot,
+              const G::Font& font, const G::Color& activeColor) {
+        const G::Color bg = active ? activeColor : (hot ? theme::ButtonHot() : theme::Button());
+        FillRound(g, bg, r, r.Height / 2.f);
+        const G::Color fg = active ? G::Color(255, 255, 255, 255) : theme::Text();
+        Text(g, label, font, fg, r, *fmtC_);
+    }
+
+    void Toggle(G::Graphics& g, const G::RectF& r, bool on) {
+        FillRound(g, on ? theme::Accent() : theme::Track(), r, r.Height / 2.f);
+        const float knob = r.Height - S(6);
+        const float kx = on ? r.X + r.Width - S(3) - knob : r.X + S(3);
+        G::SolidBrush kb(G::Color(255, 255, 255, 255));
+        g.FillEllipse(&kb, kx, r.Y + S(3), knob, knob);
+    }
+
+    void Slider(G::Graphics& g, const G::RectF& track, float level, const G::Color& fill, bool enabled,
+                bool active) {
+        FillRound(g, theme::Track(), track, track.Height / 2.f);
+        const float tx = track.X + track.Width * std::clamp(level, 0.f, 1.f);
+        if (tx - track.X > 1.f)
+            FillRound(g, enabled ? fill : theme::Muted(), G::RectF(track.X, track.Y, tx - track.X, track.Height),
+                      track.Height / 2.f);
+        const float rad = S(active ? 8.5f : 7.f);
+        const float cy = track.Y + track.Height / 2.f;
+        G::SolidBrush knob(G::Color(255, 255, 255, 255));
+        g.FillEllipse(&knob, tx - rad, cy - rad, rad * 2.f, rad * 2.f);
+    }
+
+    void DrawAppIcon(G::Graphics& g, HDC hdc, HICON icon, const std::wstring& name, const G::RectF& box) {
+        if (icon) {
+            g.Flush(G::FlushIntentionSync);
+            DrawIconEx(hdc, static_cast<int>(box.X), static_cast<int>(box.Y), icon, static_cast<int>(box.Width),
+                       static_cast<int>(box.Height), 0, nullptr, DI_NORMAL);
+            return;
+        }
+        FillRound(g, theme::Tile(), box, S(7));
+        const std::wstring letter = name.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(name[0])));
+        Text(g, letter, *fBtn_, theme::Text(), box, *fmtC_);
+    }
+
+    void Paint(G::Graphics& g, HDC hdc, int W, int H) {
+        g.SetSmoothingMode(G::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(G::TextRenderingHintClearTypeGridFit);
+        {
+            G::SolidBrush bg(theme::Bg());
+            g.FillRectangle(&bg, 0.f, 0.f, static_cast<float>(W), static_cast<float>(H));
+        }
+
+        if (screen_ == Screen::Editor) PaintEditor(g);
+        else if (screen_ == Screen::Apps) PaintApps(g, hdc);
+        else if (screen_ == Screen::Presets) PaintPresets(g);
+        else {
+            for (const Item& it : items_) {
+                const float iy = hdrH_ + it.y - scroll_;
+                if (iy + it.h < hdrH_ || iy > H_ - ftrH_) continue;
+                switch (it.type) {
+                    case Item::Status: PaintStatus(g, iy); break;
+                    case Item::Section: {
+                        TextLeft(g, it.text, *fSection_, theme::Muted(), G::RectF(S(18), iy, W_ - S(36), it.h));
+                        if (it.text == L"ATURAN OTOMATIS") {
+                            const G::RectF add = SectionAddRect(iy);
+                            Pill(g, add, L"+ Tambah", true, hot_.part == Part::AddRule, *fBtn_, theme::Accent());
+                        }
+                        break;
+                    }
+                    case Item::RuleCard: PaintRuleCard(g, hdc, it.index, iy); break;
+                    case Item::Note:
+                        Text(g, it.text, *fSmall_, theme::Muted(),
+                             G::RectF(S(18), iy, W_ - S(36), it.h), *fmtWrap_);
+                        break;
+                    case Item::LogHeader:
+                        TextLeft(g, it.text, *fSection_, theme::Muted(), G::RectF(S(18), iy, W_ - S(36), it.h));
+                        break;
+                    case Item::LogEntry: PaintLog(g, it.index, iy); break;
+                    case Item::RowItem: PaintRow(g, hdc, rows_[it.index], it.index, iy); break;
+                }
+            }
+            PaintScrollbar(g);
+        }
+
+        PaintHeader(g);
+        PaintFooter(g);
+
+        G::Pen border(theme::Border(), 1.f);
+        g.DrawRectangle(&border, 0.5f, 0.5f, static_cast<float>(W) - 1.f, static_cast<float>(H) - 1.f);
+    }
+
+    void PaintHeader(G::Graphics& g) {
+        G::SolidBrush bg(theme::Bg());
+        g.FillRectangle(&bg, 0.f, 0.f, W_, hdrH_);
+        G::Pen line(theme::Border(), 1.f);
+        g.DrawLine(&line, 0.f, hdrH_ - 0.5f, W_, hdrH_ - 0.5f);
+
+        mascot::Draw(g, mascotImg_.get(), mascot_, MascotRect(), G::RectF(0.f, 0.f, W_, hdrH_));
+
+        std::wstring title = L"Hub Volume";
+        std::wstring sub;
+        switch (screen_) {
+            case Screen::Dash: {
+                const MasterInfo master = engine_.Master();
+                sub = master.activeCount > 0 ? master.activeNames + L" sedang aktif"
+                                             : L"Tidak ada aturan yang aktif";
+                break;
+            }
+            case Screen::Mixer:
+                title = L"Mixer";
+                sub = std::to_wstring(engine_.LockCount()) + L" volume terkunci";
+                break;
+            case Screen::Editor:
+                title = editor_.isNew ? L"Aturan baru" : L"Edit aturan";
+                sub = L"Atur kapan volume turun dan seberapa rendah";
+                break;
+            case Screen::Apps:
+                title = L"Pilih aplikasi";
+                sub = L"Aplikasi berjalan diutamakan";
+                break;
+            case Screen::Presets:
+                title = L"Preset aplikasi";
+                sub = L"Siap pakai untuk aplikasi rapat";
+                break;
+        }
+        TextLeft(g, title, *fTitle_, theme::Text(), G::RectF(S(18), S(10), W_ - S(130), S(26)));
+        TextLeft(g, sub, *fSmall_, theme::Muted(), G::RectF(S(18), S(38), W_ - S(120), S(18)));
+
+        if (screen_ == Screen::Dash || screen_ == Screen::Mixer) {
+            const bool dash = screen_ == Screen::Dash;
+            Pill(g, tabDash_, L"Dasbor", dash, hot_.part == Part::TabDash, *fBtn_, theme::Accent());
+            Pill(g, tabMixer_, L"Mixer", !dash, hot_.part == Part::TabMixer, *fBtn_, theme::Accent());
+        }
+    }
+
+    void PaintFooter(G::Graphics& g) {
+        const float top = H_ - ftrH_;
+        G::SolidBrush bg(theme::Bg());
+        g.FillRectangle(&bg, 0.f, top, W_, ftrH_);
+        G::Pen line(theme::Border(), 1.f);
+        g.DrawLine(&line, 0.f, top + 0.5f, W_, top + 0.5f);
+
+        if (screen_ == Screen::Editor) {
+            if (hot_.part == Part::EditorCancel) FillRound(g, theme::Card(), cancelRect_, S(9));
+            Text(g, L"Batal", *fBtn_, theme::Muted(), cancelRect_, *fmtC_);
+            if (!editor_.isNew) {
+                if (hot_.part == Part::EditorDelete) FillRound(g, theme::Card(), deleteRect_, S(9));
+                Text(g, L"Hapus", *fBtn_, theme::Muted(), deleteRect_, *fmtC_);
+            }
+            const bool canSave = !editor_.draft.apps.empty();
+            FillRound(g, canSave ? theme::Accent() : theme::Track(), saveRect_, S(9));
+            Text(g, L"Simpan", *fBtn_, canSave ? G::Color(255, 255, 255, 255) : theme::Muted(), saveRect_, *fmtC_);
+            return;
+        }
+        if (screen_ == Screen::Apps) {
+            if (hot_.part == Part::AppsCancel) FillRound(g, theme::Card(), cancelRect_, S(9));
+            Text(g, L"Batal", *fBtn_, theme::Muted(), cancelRect_, *fmtC_);
+            const bool canPick = !editor_.draft.apps.empty();
+            FillRound(g, canPick ? theme::Accent() : theme::Track(), doneRect_, S(9));
+            Text(g, L"Selesai", *fBtn_, canPick ? G::Color(255, 255, 255, 255) : theme::Muted(), doneRect_, *fmtC_);
+            return;
+        }
+        if (screen_ == Screen::Presets) {
+            if (hot_.part == Part::PresetsCancel) FillRound(g, theme::Card(), cancelRect_, S(9));
+            Text(g, L"Batal", *fBtn_, theme::Muted(), cancelRect_, *fmtC_);
+            return;
+        }
+
+        const bool hotS = hot_.part == Part::Startup;
+        if (hotS) FillRound(g, theme::Card(), startupRect_, S(8));
+        const G::RectF tr(startupRect_.X + S(8), top + S(19), S(34), S(18));
+        Toggle(g, tr, startup_);
+        TextLeft(g, L"Mulai bersama Windows", *fRow_, theme::Text(),
+                 G::RectF(startupRect_.X + S(50), startupRect_.Y, startupRect_.Width - S(50), startupRect_.Height));
+
+        if (hot_.part == Part::Quit) FillRound(g, theme::Card(), quitRect_, S(8));
+        Text(g, L"Keluar", *fRow_, theme::Muted(), quitRect_, *fmtC_);
+    }
+
+    void PaintScrollbar(G::Graphics& g) {
+        if (contentH_ <= viewportH_ + 0.5f) return;
+        const float trackH = viewportH_ - S(8);
+        const float thumbH = std::max(S(24), trackH * viewportH_ / contentH_);
+        const float maxScroll = contentH_ - viewportH_;
+        const float ty = hdrH_ + S(4) + (trackH - thumbH) * (scroll_ / maxScroll);
+        FillRound(g, G::Color(120, 150, 156, 168), G::RectF(W_ - S(6), ty, S(3), thumbH), S(1.5f));
+    }
+
+    void PaintStatus(G::Graphics& g, float iy) {
+        const MasterInfo master = engine_.Master();
+        const StatusRects rc = StatusRectsFor(iy, master.locked);
+        FillRound(g, theme::Card(), rc.card, S(12));
+
+        TextLeft(g, L"Volume utama", *fRow_, theme::Text(),
+                 G::RectF(rc.card.X + S(14), iy + S(8), S(150), S(20)));
+        Text(g, master.live ? (master.now.muted ? L"Bisu" : Percent(master.now.level)) : L"\u2014",
+             *fH2_, theme::Text(), G::RectF(rc.card.X + S(160), iy + S(7), rc.lock.X - S(168) - rc.card.X, S(22)),
+             *fmtR_);
+
+        const bool hotL = hot_.part == Part::MasterLock;
+        FillRound(g, master.locked ? (hotL ? theme::AmberBgHot() : theme::AmberBg())
+                                   : (hotL ? theme::ButtonHot() : theme::Button()), rc.lock, S(14));
+        const G::Color lc = master.locked ? theme::Amber() : theme::Text();
+        glyph::Lock(g, rc.lock.X + S(10), rc.lock.Y + S(6), S(15), lc, master.locked);
+        TextLeft(g, master.locked ? L"Terkunci" : L"Kunci", *fBtn_, lc,
+                 G::RectF(rc.lock.X + S(28), rc.lock.Y, rc.lock.Width - S(32), rc.lock.Height));
+
+        const bool muted = master.live && master.now.muted;
+        const bool hotM = hot_.part == Part::MasterMute;
+        if (hotM && master.live && !master.locked) FillRound(g, theme::Button(), rc.mute, S(6));
+        glyph::Speaker(g, rc.mute.X + S(6), rc.mute.Y + S(6), S(16), master.live ? theme::Text() : theme::Muted(), muted);
+
+        const float level = master.locked ? master.lockedTo.level : (master.live ? master.now.level : 0.f);
+        const bool activeDrag = dragging_ && drag_ == Drag::Master && dragKind_ == Kind::Output;
+        Slider(g, rc.track, level, master.locked ? theme::Amber() : theme::Accent(), master.live, activeDrag);
+        Text(g, master.live ? Percent(level) : L"\u2014", *fPct_, theme::Muted(),
+             G::RectF(rc.card.X + rc.card.Width - S(14) - S(40), iy + S(48), S(40), S(24)), *fmtR_);
+
+        std::wstring line1;
+        if (master.activeCount > 0) {
+            line1 = master.activeNames + L" aktif";
+        } else {
+            line1 = L"Tidak ada aturan aktif";
+        }
+        std::wstring line2 = std::to_wstring(engine_.RuleCount()) + L" aturan";
+        if (master.locked) line2 += L" \u00B7 terkunci di " + Percent(master.lockedTo.level);
+        if (master.activeCount > 0) line2 += L" \u00B7 " + std::to_wstring(master.activeCount) + L" sedang menyala";
+
+        TextLeft(g, line1, *fSmall_, master.activeCount > 0 ? theme::Green() : theme::Muted(),
+                 G::RectF(rc.card.X + S(14), iy + S(70), rc.card.Width - S(28), S(16)));
+        TextLeft(g, line2, *fSmall_, master.locked ? theme::Amber() : theme::Muted(),
+                 G::RectF(rc.card.X + S(14), iy + S(86), rc.card.Width - S(28), S(14)));
+    }
+
+    void PaintRuleCard(G::Graphics& g, HDC hdc, int index, float iy) {
+        const Rule* rule = RuleAt(index);
+        if (!rule) return;
+        const RuleRects rc = RuleRectsFor(iy);
+        FillRound(g, theme::Card(), rc.card, S(12));
+
+        auto entry = appMap_.find(util::Lower(rule->apps.empty() ? std::wstring() : rule->apps.front()));
+        HICON icon = entry == appMap_.end() ? nullptr : entry->second.icon;
+        DrawAppIcon(g, hdc, icon, rule->name, rc.icon);
+
+        const G::Color nameColor = rule->enabled ? theme::Text() : theme::Muted();
+        TextLeft(g, rule->name.empty() ? L"Aturan" : rule->name, *fH2_, nameColor, rc.name);
+        TextLeft(g, ConditionText(*rule), *fSmall_, theme::Muted(), rc.cond);
+
+        const bool on = rule->enabled;
+        const bool hotToggle = hot_.part == Part::RuleToggle && hot_.index == index;
+        if (hotToggle) FillRound(g, theme::Tile(), G::RectF(rc.toggle.X - S(2), rc.toggle.Y - S(2),
+                                                             rc.toggle.Width + S(4), rc.toggle.Height + S(4)), S(13));
+        Toggle(g, rc.toggle, on);
+
+        const float level = rule->target;
+        const bool activeDrag = dragging_ && drag_ == Drag::Rule && dragIndex_ == index;
+        Slider(g, rc.track, level, theme::Accent(), on, activeDrag);
+        Text(g, Percent(level), *fPct_, on ? theme::Text() : theme::Muted(), rc.pct, *fmtR_);
+
+        struct Action { const G::RectF& rect; Part part; const wchar_t* label; G::Color color; };
+        const Action actions[] = {
+            {rc.sim, Part::RuleSim, L"Simulasi", theme::Accent()},
+            {rc.edit, Part::RuleEdit, L"Edit", theme::Muted()},
+            {rc.del, Part::RuleDelete, L"Hapus", theme::Muted()},
+        };
+        for (const Action& a : actions) {
+            const bool hot = hot_.part == a.part && hot_.index == index;
+            if (hot) FillRound(g, theme::Button(), a.rect, S(6));
+            Text(g, a.label, *fTiny_, a.color, a.rect, *fmtC_);
+        }
+
+        if (engine_.RuleActive(rule->id)) {
+            FillRound(g, theme::GreenBg(), rc.badge, S(11));
+            Text(g, L"AKTIF", *fTiny_, theme::Green(), rc.badge, *fmtC_);
+        }
+    }
+
+    void PaintLog(G::Graphics& g, int index, float iy) {
+        const std::vector<LogEntry>& log = engine_.Log();
+        if (index < 0 || static_cast<size_t>(index) >= log.size()) return;
+        const LogEntry& entry = log[index];
+        TextLeft(g, entry.clock, *fSmall_, theme::Muted(), G::RectF(S(18), iy, S(42), S(20)));
+        Text(g, entry.text, *fSmall_, theme::Text(), G::RectF(S(64), iy, W_ - S(82), S(20)), *fmtWrap_);
+    }
+
+    void PaintRow(G::Graphics& g, HDC hdc, const Row& r, int idx, float iy) {
+        const RowRects rc = RowRectsFor(iy);
+        const bool dim = !r.live;
+        FillRound(g, theme::Card(), rc.card, S(10));
+
+        if (r.kind == Kind::App && r.icon) {
+            DrawAppIcon(g, hdc, r.icon, r.title, rc.icon);
+        } else {
+            FillRound(g, theme::Tile(), rc.icon, S(6));
+            const G::Color gc = dim ? theme::Muted() : theme::Text();
+            const float gs = S(16), gx = rc.icon.X + S(4), gy = rc.icon.Y + S(4);
+            if (r.kind == Kind::Input) glyph::Mic(g, gx, gy, gs, gc, false);
+            else if (r.kind == Kind::Output) glyph::Speaker(g, gx, gy, gs, gc, false);
+            else DrawAppIcon(g, hdc, nullptr, r.title, rc.icon);
+        }
+
+        Text(g, r.title, *fRow_, dim ? theme::Muted() : theme::Text(), rc.title, *fmtL_);
+        Text(g, StatusText(r), *fSmall_, r.locked ? theme::Amber() : theme::Muted(), rc.status, *fmtL_);
+
+        const bool hotL = hot_.part == Part::RowLock && hot_.index == idx;
+        FillRound(g, r.locked ? (hotL ? theme::AmberBgHot() : theme::AmberBg())
+                              : (hotL ? theme::ButtonHot() : theme::Button()), rc.lock, S(13));
+        const G::Color lc = r.locked ? theme::Amber() : theme::Text();
+        glyph::Lock(g, rc.lock.X + S(10), rc.lock.Y + S(5), S(16), lc, r.locked);
+        Text(g, r.locked ? L"Terkunci" : L"Kunci", *fBtn_, lc,
+             G::RectF(rc.lock.X + S(28), rc.lock.Y, rc.lock.Width - S(32), rc.lock.Height), *fmtL_);
+
+        const bool mutedNow = r.locked ? r.lockedTo.muted : r.now.muted;
+        const bool hotM = hot_.part == Part::RowMute && hot_.index == idx;
+        if (hotM && !r.locked && r.live) FillRound(g, theme::Button(), rc.mute, S(6));
+        const G::Color mc = (r.locked || !r.live) ? theme::Muted() : theme::Text();
+        if (r.kind == Kind::Input) glyph::Mic(g, rc.mute.X + S(4), rc.mute.Y + S(4), S(16), mc, mutedNow);
+        else glyph::Speaker(g, rc.mute.X + S(4), rc.mute.Y + S(4), S(16), mc, mutedNow);
+
+        const float level = r.locked ? r.lockedTo.level : r.now.level;
+        G::Color fill = r.locked ? theme::Amber() : theme::Accent();
+        const bool activeDrag = dragging_ && drag_ == Drag::Master && dragKey_ == r.key;
+        Slider(g, rc.track, level, fill, !r.locked && r.live, activeDrag);
+        Text(g, mutedNow ? L"Bisu" : Percent(level), *fPct_, theme::Muted(), rc.pct, *fmtR_);
+    }
 
     static std::wstring StatusText(const Row& r) {
         std::wstring s;
@@ -2439,138 +4282,149 @@ private:
         return s;
     }
 
-    void Paint(G::Graphics& g, HDC hdc, int W, int H) {
-        g.SetSmoothingMode(G::SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(G::TextRenderingHintClearTypeGridFit);
-        {
-            G::SolidBrush bg(theme::Bg());
-            g.FillRectangle(&bg, 0.f, 0.f, static_cast<float>(W), static_cast<float>(H));
+    void PaintEditor(G::Graphics& g) {
+        const EditorRects rc = EditorLayout();
+        const float oy = hdrH_ - scroll_;
+        const Rule& d = editor_.draft;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+
+        auto card = [&](const G::RectF& r) {
+            FillRound(g, theme::Card(), G::RectF(r.X, r.Y + oy, r.Width, r.Height), S(12));
+        };
+
+        card(rc.appsCard);
+        TextLeft(g, L"APLIKASI", *fTiny_, theme::Muted(), G::RectF(rc.appsLabel.X, rc.appsLabel.Y + oy, rc.appsLabel.Width, rc.appsLabel.Height));
+        TextLeft(g, SelectText(d), *fRow_, d.apps.empty() ? theme::Muted() : theme::Text(),
+                 G::RectF(cx + S(12), oy + rc.appsCard.Y + S(22), cw - S(24), S(20)));
+        Pill(g, G::RectF(rc.changeApps.X, rc.changeApps.Y + oy, rc.changeApps.Width, rc.changeApps.Height),
+             L"Pilih app", hot_.part == Part::EditorApps, hot_.part == Part::EditorApps, *fTiny_, theme::Accent());
+        Pill(g, G::RectF(rc.presetBtn.X, rc.presetBtn.Y + oy, rc.presetBtn.Width, rc.presetBtn.Height),
+             L"Preset", false, hot_.part == Part::EditorPreset, *fTiny_, theme::Accent());
+        Pill(g, G::RectF(rc.manualBtn.X, rc.manualBtn.Y + oy, rc.manualBtn.Width, rc.manualBtn.Height),
+             L".exe manual", false, hot_.part == Part::EditorManual, *fTiny_, theme::Accent());
+
+        card(rc.targetCard);
+        TextLeft(g, L"TURUNKAN KE", *fTiny_, theme::Muted(),
+                 G::RectF(cx + S(14), oy + rc.targetCard.Y + S(8), S(160), S(16)));
+        Text(g, Percent(d.target), *fBig_, theme::Text(),
+             G::RectF(cx + cw - S(14) - S(90), oy + rc.targetCard.Y + S(6), S(90), S(30)), *fmtR_);
+        const bool activeDrag = dragging_ && drag_ == Drag::EditorTarget;
+        Slider(g, G::RectF(rc.track.X, rc.track.Y + oy, rc.track.Width, rc.track.Height), d.target, theme::Accent(), true,
+               activeDrag);
+        Pill(g, G::RectF(rc.modeMaster.X, rc.modeMaster.Y + oy, rc.modeMaster.Width, rc.modeMaster.Height),
+             L"Volume utama", d.useMaster, hot_.part == Part::EditorModeMaster, *fTiny_, theme::Accent());
+        Pill(g, G::RectF(rc.modeApp.X, rc.modeApp.Y + oy, rc.modeApp.Width, rc.modeApp.Height),
+             L"Volume aplikasi", !d.useMaster, hot_.part == Part::EditorModeApp, *fTiny_, theme::Accent());
+        Text(g, d.useMaster ? L"Master perangkat" : (d.apps.empty() ? L"Pilih aplikasi" : DisplayName(d.apps.front())),
+             *fSmall_, theme::Muted(),
+             G::RectF(cx + S(240), oy + rc.targetCard.Y + S(70), cw - S(252), S(24)), *fmtR_);
+
+        card(rc.delayCard);
+        TextLeft(g, L"KEMBALIKAN SETELAH", *fTiny_, theme::Muted(),
+                 G::RectF(cx + S(14), oy + rc.delayCard.Y + S(8), S(220), S(16)));
+        const int values[5] = {1000, 2000, 3000, 5000, 10000};
+        const wchar_t* labels[5] = {L"1 dtk", L"2 dtk", L"3 dtk", L"5 dtk", L"10 dtk"};
+        for (int i = 0; i < 5; ++i) {
+            const bool sel = d.delayMs == values[i];
+            const bool hot = hot_.part == Part::EditorDelay && hot_.index == i;
+            Pill(g, G::RectF(rc.delay[i].X, rc.delay[i].Y + oy, rc.delay[i].Width, rc.delay[i].Height), labels[i], sel,
+                 hot, *fTiny_, theme::Accent());
         }
 
-        for (const Item& it : items_) {
-            const float iy = hdrH_ + it.y - scroll_;
-            if (iy + it.h < hdrH_ || iy > H_ - ftrH_) continue;
-            switch (it.type) {
-                case Item::Section:
-                    Text(g, it.text, *fSection_, theme::Muted(), G::RectF(S(20), iy, W_ - S(40), it.h), *fmtL_);
-                    break;
-                case Item::Note:
-                    Text(g, it.text, *fSmall_, theme::Muted(), G::RectF(S(20), iy, W_ - S(40), it.h), *fmtC_);
-                    break;
-                case Item::RowItem: PaintRow(g, hdc, rows_[it.row], it.row, iy); break;
+        card(rc.restoreCard);
+        TextLeft(g, L"Kembalikan volume sebelumnya", *fRow_, theme::Text(),
+                 G::RectF(cx + S(14), oy + rc.restoreCard.Y + S(13), cw - S(70), S(22)));
+        Toggle(g, G::RectF(rc.restoreToggle.X, rc.restoreToggle.Y + oy, rc.restoreToggle.Width, rc.restoreToggle.Height),
+               d.restore);
+
+        card(rc.condCard);
+        TextLeft(g, L"ATURAN AKTIF SAAT", *fTiny_, theme::Muted(),
+                 G::RectF(cx + S(14), oy + rc.condCard.Y + S(8), S(240), S(16)));
+        Pill(g, G::RectF(rc.micChip.X, rc.micChip.Y + oy, rc.micChip.Width, rc.micChip.Height), L"Mikrofon aktif",
+             d.cond.mic, hot_.part == Part::EditorMic, *fTiny_, theme::Accent());
+        Pill(g, G::RectF(rc.audioChip.X, rc.audioChip.Y + oy, rc.audioChip.Width, rc.audioChip.Height),
+             L"Audio keluar", d.cond.audio, hot_.part == Part::EditorAudio, *fTiny_, theme::Accent());
+        TextLeft(g, L"Aturan aktif saat semua kondisi terpenuhi.",
+                 *fSmall_, theme::Muted(),
+                 G::RectF(cx + S(14), oy + rc.condCard.Y + S(62), cw - S(28), S(18)));
+        PaintScrollbar(g);
+    }
+
+    void PaintApps(G::Graphics& g, HDC hdc) {
+        const float oy = hdrH_ - scroll_;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+
+        const G::RectF manual(cx, S(6) + oy, S(140), S(30));
+        const G::RectF preset(cx + S(148), S(6) + oy, S(150), S(30));
+        Pill(g, manual, L".exe manual", false, hot_.part == Part::AppsManual, *fBtn_, theme::Accent());
+        Pill(g, preset, L"Preset siap pakai", false, hot_.part == Part::AppsPreset, *fBtn_, theme::Accent());
+
+        if (apps_.empty()) {
+            Text(g, L"Belum ada aplikasi berjalan dengan jendela atau audio. Pakai .exe manual atau preset.",
+                 *fSmall_, theme::Muted(), G::RectF(S(20), S(48) + oy, W_ - S(40), S(60)), *fmtWrap_);
+            return;
+        }
+
+        for (size_t i = 0; i < apps_.size(); ++i) {
+            const AppInfo& app = apps_[i];
+            const G::RectF row(cx, S(44) + oy + static_cast<float>(i) * S(54), cw, S(48));
+            const bool hot = hot_.part == Part::AppsRow && hot_.index == static_cast<int>(i);
+            FillRound(g, hot ? theme::ButtonHot() : theme::Card(), row, S(10));
+
+            const G::RectF icon(row.X + S(10), row.Y + S(10), S(26), S(26));
+            DrawAppIcon(g, hdc, app.icon, app.name, icon);
+            TextLeft(g, app.name, *fRow_, theme::Text(),
+                     G::RectF(row.X + S(46), row.Y + S(7), row.Width - S(100), S(18)));
+            std::wstring detail = util::Lower(app.exe);
+            if (app.mic) detail += L"  \u00B7  mikrofon";
+            else if (app.audio) detail += L"  \u00B7  audio";
+            TextLeft(g, detail, *fSmall_, theme::Muted(),
+                     G::RectF(row.X + S(46), row.Y + S(25), row.Width - S(100), S(16)));
+
+            const bool selected =
+                std::find(editor_.draft.apps.begin(), editor_.draft.apps.end(), util::Lower(app.exe)) !=
+                editor_.draft.apps.end();
+            const G::RectF check(row.X + row.Width - S(12) - S(20), row.Y + S(13), S(20), S(20));
+            if (selected) {
+                G::SolidBrush b(theme::Accent());
+                g.FillEllipse(&b, check.X, check.Y, check.Width, check.Height);
+                G::Pen pen(G::Color(255, 255, 255, 255), S(2.f));
+                pen.SetStartCap(G::LineCapRound);
+                pen.SetEndCap(G::LineCapRound);
+                g.DrawLine(&pen, check.X + S(5), check.Y + S(10), check.X + S(8.5f), check.Y + S(14));
+                g.DrawLine(&pen, check.X + S(8.5f), check.Y + S(14), check.X + S(15), check.Y + S(6));
+            } else {
+                G::Pen pen(theme::Border(), S(1.4f));
+                g.DrawEllipse(&pen, check.X, check.Y, check.Width, check.Height);
             }
         }
         PaintScrollbar(g);
-        PaintHeader(g);
-        PaintFooter(g);
-
-        G::Pen border(theme::Border(), 1.f);
-        g.DrawRectangle(&border, 0.5f, 0.5f, static_cast<float>(W) - 1.f, static_cast<float>(H) - 1.f);
     }
 
-    void PaintHeader(G::Graphics& g) {
-        G::SolidBrush bg(theme::Bg());
-        g.FillRectangle(&bg, 0.f, 0.f, W_, hdrH_);
-
-        G::Pen line(theme::Border(), 1.f);
-        g.DrawLine(&line, 0.f, hdrH_ - 0.5f, W_, hdrH_ - 0.5f);
-
-        mascot::Draw(g, mascotImg_.get(), mascot_, MascotRect(), G::RectF(0.f, 0.f, W_, hdrH_));
-
-        Text(g, L"Hub Volume", *fTitle_, theme::Text(), G::RectF(S(20), S(14), W_ - S(40), S(26)), *fmtL_);
-        const size_t n = engine_.LockCount();
-        const std::wstring sub = n == 0 ? L"Belum ada volume yang dikunci"
-                                        : std::to_wstring(n) + L" volume terkunci";
-        Text(g, sub, *fSmall_, n ? theme::Amber() : theme::Muted(), G::RectF(S(20), S(42), W_ - S(40), S(18)), *fmtL_);
-    }
-
-    void PaintFooter(G::Graphics& g) {
-        const float top = H_ - ftrH_;
-        G::SolidBrush bg(theme::Bg());
-        g.FillRectangle(&bg, 0.f, top, W_, ftrH_);
-        G::Pen line(theme::Border(), 1.f);
-        g.DrawLine(&line, 0.f, top + 0.5f, W_, top + 0.5f);
-
-        const bool hotS = hot_.part == Part::Startup;
-        if (hotS) FillRound(g, theme::Card(), startupRect_, S(8));
-        const G::RectF tr(startupRect_.X + S(8), top + S(19), S(34), S(18));
-        FillRound(g, startup_ ? theme::Accent() : theme::Track(), tr, S(9));
-        const float knob = S(12);
-        const float kx = startup_ ? tr.X + tr.Width - S(3) - knob : tr.X + S(3);
-        G::SolidBrush kb(G::Color(255, 255, 255, 255));
-        g.FillEllipse(&kb, kx, tr.Y + S(3), knob, knob);
-        Text(g, L"Mulai bersama Windows", *fRow_, theme::Text(),
-             G::RectF(startupRect_.X + S(50), startupRect_.Y, startupRect_.Width - S(50), startupRect_.Height), *fmtL_);
-
-        if (hot_.part == Part::Quit) FillRound(g, theme::Card(), quitRect_, S(8));
-        Text(g, L"Keluar", *fRow_, theme::Muted(), quitRect_, *fmtC_);
-    }
-
-    void PaintScrollbar(G::Graphics& g) {
-        if (contentH_ <= viewportH_ + 0.5f) return;
-        const float trackH = viewportH_ - S(8);
-        const float thumbH = std::max(S(24), trackH * viewportH_ / contentH_);
-        const float maxScroll = contentH_ - viewportH_;
-        const float ty = hdrH_ + S(4) + (trackH - thumbH) * (scroll_ / maxScroll);
-        FillRound(g, G::Color(120, 150, 156, 168), G::RectF(W_ - S(6), ty, S(3), thumbH), S(1.5f));
-    }
-
-    void PaintRow(G::Graphics& g, HDC hdc, const Row& r, int idx, float iy) {
-        const RowRects rc = RectsFor(iy);
-        const bool dim = !r.live;
-        FillRound(g, theme::Card(), rc.card, S(10));
-
-        if (r.kind == Kind::App && r.icon) {
-            g.Flush(G::FlushIntentionSync);
-            DrawIconEx(hdc, static_cast<int>(rc.icon.X), static_cast<int>(rc.icon.Y), r.icon,
-                       static_cast<int>(rc.icon.Width), static_cast<int>(rc.icon.Height), 0, nullptr, DI_NORMAL);
-        } else {
-            FillRound(g, theme::Tile(), rc.icon, S(6));
-            const G::Color gc = dim ? theme::Muted() : theme::Text();
-            const float gs = S(16), gx = rc.icon.X + S(4), gy = rc.icon.Y + S(4);
-            if (r.kind == Kind::Input) {
-                glyph::Mic(g, gx, gy, gs, gc, false);
-            } else if (r.kind == Kind::Output) {
-                glyph::Speaker(g, gx, gy, gs, gc, false);
-            } else {
-                const std::wstring letter = r.title.empty() ? L"?" : std::wstring(1, static_cast<wchar_t>(towupper(r.title[0])));
-                Text(g, letter, *fBtn_, gc, rc.icon, *fmtC_);
-            }
+    void PaintPresets(G::Graphics& g) {
+        const float oy = hdrH_ - scroll_;
+        const float cx = S(kCardMargin), cw = W_ - 2.f * cx;
+        const std::vector<Preset>& list = engine_.Presets();
+        for (size_t i = 0; i < list.size(); ++i) {
+            const Preset& preset = list[i];
+            const G::RectF row(cx, S(8) + oy + static_cast<float>(i) * S(60), cw, S(54));
+            const bool hot = hot_.part == Part::PresetRow && hot_.index == static_cast<int>(i);
+            FillRound(g, hot ? theme::ButtonHot() : theme::Card(), row, S(10));
+            TextLeft(g, preset.name, *fH2_, theme::Text(),
+                     G::RectF(row.X + S(14), row.Y + S(8), row.Width - S(28), S(20)));
+            TextLeft(g, preset.note, *fSmall_, theme::Muted(),
+                     G::RectF(row.X + S(14), row.Y + S(29), row.Width - S(28), S(16)));
         }
-
-        Text(g, r.title, *fRow_, dim ? theme::Muted() : theme::Text(), rc.title, *fmtL_);
-        Text(g, StatusText(r), *fSmall_, r.locked ? theme::Amber() : theme::Muted(), rc.status, *fmtL_);
-
-        const bool hotL = hot_.part == Part::Lock && hot_.row == idx;
-        FillRound(g, r.locked ? (hotL ? theme::AmberBgHot() : theme::AmberBg())
-                              : (hotL ? theme::ButtonHot() : theme::Button()), rc.lock, S(13));
-        const G::Color lc = r.locked ? theme::Amber() : theme::Text();
-        glyph::Lock(g, rc.lock.X + S(10), rc.lock.Y + S(5), S(16), lc, r.locked);
-        Text(g, r.locked ? L"Terkunci" : L"Kunci", *fBtn_, lc,
-             G::RectF(rc.lock.X + S(28), rc.lock.Y, rc.lock.Width - S(32), rc.lock.Height), *fmtL_);
-
-        const bool mutedNow = r.locked ? r.lockedTo.muted : r.now.muted;
-        const bool hotM = hot_.part == Part::Mute && hot_.row == idx;
-        if (hotM && !r.locked && r.live) FillRound(g, theme::Button(), rc.mute, S(6));
-        const G::Color mc = (r.locked || !r.live) ? theme::Muted() : theme::Text();
-        if (r.kind == Kind::Input) glyph::Mic(g, rc.mute.X + S(4), rc.mute.Y + S(4), S(16), mc, mutedNow);
-        else glyph::Speaker(g, rc.mute.X + S(4), rc.mute.Y + S(4), S(16), mc, mutedNow);
-
-        const float level = r.locked ? r.lockedTo.level : r.now.level;
-        G::Color fill = r.locked ? theme::Amber() : theme::Accent();
-        if (!r.locked && (mutedNow || !r.live)) fill = theme::Muted();
-        FillRound(g, theme::Track(), rc.track, rc.track.Height / 2.f);
-        const float tx = rc.track.X + rc.track.Width * std::clamp(level, 0.f, 1.f);
-        if (tx - rc.track.X > 1.f)
-            FillRound(g, fill, G::RectF(rc.track.X, rc.track.Y, tx - rc.track.X, rc.track.Height), rc.track.Height / 2.f);
-        const bool active = dragging_ && dragKind_ == r.kind && dragKey_ == r.key;
-        const float tr = S(active ? 8.5f : 7.f);
-        const float cy = rc.track.Y + rc.track.Height / 2.f;
-        G::SolidBrush knob(r.locked ? G::Color(255, 255, 226, 160) : G::Color(255, 255, 255, 255));
-        g.FillEllipse(&knob, tx - tr, cy - tr, tr * 2.f, tr * 2.f);
-
-        Text(g, mutedNow ? L"Bisu" : Percent(level), *fPct_, theme::Muted(), rc.pct, *fmtR_);
+        PaintScrollbar(g);
     }
+
+    // ---------------------------------------------------------------- state
+
+    struct Editor {
+        bool open = false;
+        bool isNew = false;
+        Rule draft;
+    };
 
     Engine& engine_;
     FlyoutHost& host_;
@@ -2580,24 +4434,39 @@ private:
     // GDI+ harus dibuat lebih dulu dan dihancurkan paling akhir.
     GdiplusSession gdip_;
     std::unique_ptr<G::FontFamily> family_;
-    std::unique_ptr<G::Font> fTitle_, fRow_, fBtn_, fSmall_, fPct_, fSection_;
-    std::unique_ptr<G::StringFormat> fmtL_, fmtR_, fmtC_;
+    std::unique_ptr<G::Font> fTitle_, fH2_, fBig_, fRow_, fBtn_, fSmall_, fPct_, fTiny_, fSection_;
+    std::unique_ptr<G::StringFormat> fmtL_, fmtR_, fmtC_, fmtWrap_;
 
     float scale_ = 1.f, W_ = 0.f, H_ = 0.f, hdrH_ = 0.f, ftrH_ = 0.f;
     float contentH_ = 0.f, viewportH_ = 0.f, scroll_ = 0.f;
-    G::RectF startupRect_, quitRect_;
+    RECT work_{};
+    POINT anchor_{};
+
+    G::RectF startupRect_, quitRect_, cancelRect_, saveRect_, deleteRect_, doneRect_;
+    G::RectF tabDash_, tabMixer_;
     std::vector<Row> rows_;
+    std::vector<AppInfo> apps_;
+    std::map<std::wstring, AppMapEntry> appMap_;
     std::vector<Item> items_;
+    Screen screen_ = Screen::Dash;
+    Editor editor_;
+    bool pickerForNew_ = false;
+
     bool startup_ = false;
     bool tracking_ = false;
     bool dragging_ = false;
+    bool modal_ = false;
+    bool wasActive_ = false;
+    Drag drag_ = Drag::None;
+    int dragIndex_ = -1;
+    Kind dragKind_ = Kind::Output;
+    std::wstring dragKey_;
+    G::RectF dragTrack_;
 
     std::unique_ptr<G::Bitmap> mascotImg_;
     mascot::State mascot_;
     bool animate_ = false;
     ULONGLONG lastTick_ = 0;
-    Kind dragKind_ = Kind::Output;
-    std::wstring dragKey_;
     Hit hot_, pressed_;
 };
 
@@ -2607,6 +4476,7 @@ public:
 
     int Run(bool showUi) {
         cfg_.Load();
+        theme::SetLight(AppThemeIsLight());
 
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
@@ -2692,10 +4562,11 @@ private:
                 else engine_.OnTimer(wp);
                 return 0;
             case WM_SETTINGCHANGE:
-
                 if (lp && wcscmp(reinterpret_cast<const wchar_t*>(lp), L"ImmersiveColorSet") == 0) {
+                    theme::SetLight(AppThemeIsLight());
                     icons_.Build(TaskbarIsLight());
                     UpdateTray();
+                    if (flyout_) flyout_->OnSystemTheme();
                 }
                 return 0;
             case WM_DESTROY:

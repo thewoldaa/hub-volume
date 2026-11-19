@@ -3,20 +3,21 @@
 Mixer volume mini untuk Windows yang bisa **mengunci** volume perangkat keluaran, mikrofon, dan aplikasi. Kalau ada yang mengubah nilai yang terkunci — tombol media, mixer Windows, aplikasi lain, software headset — Hub Volume langsung mengembalikannya.
 
 <p align="center">
-  <img src="assets/screenshot.png" width="392" alt="Mixer Hub Volume">
+  <img src="assets/screenshot.png" width="424" alt="Dasbor Hub Volume">
 </p>
 
 Windows 10/11 · C++ native · satu executable · tanpa instalasi
 
 ## Fitur
 
+- **Aturan volume otomatis.** Saat aplikasi pilihan masuk panggilan, volumenya turun ke level yang kamu tentukan lalu kembali sendiri. Satu aturan per aplikasi, dengan preset siap pakai untuk Discord, Zoom, Teams, Google Meet, Skype, Slack, Webex, Telegram, dan WhatsApp Desktop.
 - **Kunci per target** untuk perangkat keluaran, mikrofon, dan sesi aplikasi. Tombol kunci menyimpan level dan status bisu saat itu.
 - **Berbasis event**, bukan polling. Kunci memakai callback Core Audio, jadi proses yang menganggur memakai 0% CPU.
 - **Tetap berlaku saat aplikasi atau perangkat datang dan pergi.** Kunci aplikasi memakai nama exe, kunci perangkat memakai endpoint ID, sehingga otomatis aktif lagi saat Discord dibuka ulang atau headset dicolok kembali.
 - **Semua perangkat aktif** ikut dipantau, bukan hanya perangkat default.
 - **Berjalan di tray.** Jendela mixer hanya dibuat saat dibuka dan dihancurkan saat ditutup, termasuk sesi GDI+.
 - **Autostart opsional** per pengguna, tanpa hak administrator dan tanpa scheduled task.
-- **Sadar DPI**, mendukung scroll, dengan tampilan flyout gelap.
+- **Sadar DPI**, dengan tema terang dan gelap yang mengikuti Windows.
 - **Satu berkas.** CRT statis, tanpa .NET, WebView2, atau Qt.
 
 ## Unduh
@@ -25,8 +26,8 @@ Ambil dari [Releases](https://github.com/thewoldaa/hub-volume/releases):
 
 | Berkas | Keterangan |
 | --- | --- |
-| `HubVolume-Setup-1.0.0.exe` | Installer per pengguna, tanpa popup admin. |
-| `HubVolume-1.0.0-portable.zip` | Ekstrak di mana saja, jalankan `HubVolume.exe`. |
+| `HubVolume-Setup-1.1.0.exe` | Installer per pengguna, tanpa popup admin. |
+| `HubVolume-1.1.0-portable.zip` | Ekstrak di mana saja, jalankan `HubVolume.exe`. |
 
 Biner belum ditandatangani secara digital, jadi SmartScreen bisa menampilkan peringatan saat pertama dijalankan. Source tersedia di repo ini dan bisa dibangun ulang dengan langkah di bawah.
 
@@ -37,9 +38,18 @@ Biner belum ditandatangani secara digital, jadi SmartScreen bisa menampilkan per
 3. Atur level, lalu tekan **Kunci** pada baris tersebut. Ikon kunci berubah amber dan nilainya dijaga.
 4. Tekan **Terkunci** untuk melepas. **Buka kunci semua** ada di menu tray.
 
+### Aturan otomatis
+
+1. Buka tab **Dasbor**, tekan **+ Tambah**.
+2. Pilih aplikasi dari daftar proses berjalan, dari preset, atau lewat berkas `.exe`.
+3. Tentukan seberapa rendah volumenya dan volume mana yang diturunkan (utama atau aplikasi itu sendiri).
+4. Pilih jeda pemulihan, lalu **Simpan**. Tombol **Simulasi** di kartu aturan dipakai untuk menguji tanpa menunggu panggilan sungguhan.
+
+Aturan aktif saat aplikasi membuka mikrofon atau memutar audio, sesuai kondisi yang dicentang. Kalau beberapa aturan aktif bersamaan, target terendah yang dipakai. Kunci pada target yang sama ikut berpindah mengikuti aturan lalu kembali ke posisi semula setelah selesai, dan perubahan manual saat aturan aktif tetap dihormati.
+
 Bar bawah berisi **Mulai bersama Windows** dan **Keluar**. Kunci hanya bekerja selama Hub Volume berjalan; keluar saat masih ada kunci akan memunculkan konfirmasi.
 
-Pengaturan dan daftar kunci disimpan di `%LOCALAPPDATA%\HubVolume\config.txt`.
+Pengaturan, aturan, dan daftar kunci disimpan di `%LOCALAPPDATA%\HubVolume\config.json`. Preset aplikasi ada di `presets.json` di folder yang sama dan bisa diedit manual.
 
 ## Build
 
@@ -69,7 +79,9 @@ cmake --build dist/build --config Release
 
 Setiap endpoint dipasangi callback `IAudioEndpointVolume`, dan setiap sesi aplikasi callback `IAudioSessionEvents`. Callback tidak pernah memanggil API audio atau menyentuh state aplikasi; ia hanya mengirim pesan berisi ID target ke jendela utama. Thread utama membaca nilai sebenarnya, membandingkannya dengan nilai kunci, lalu menulis koreksi dengan GUID privat agar perubahannya sendiri tidak memicu koreksi baru.
 
-Koreksi untuk target yang sama dibatasi sekitar 80 kali per detik. Target yang tidak dikunci hanya dibaca saat jendela mixer terbuka. Kunci hanyalah record di `config.txt` yang ditulis secara atomik lewat berkas sementara.
+Aturan memakai sinyal yang sama: satu proses latar memetakan proses berjalan ke sesi audio dan sesi mikrofonnya, dan hanya berjalan selama ada aturan yang aktif. Aturan yang cocok menyimpan level saat itu, menerapkan target, lalu memulai timer pemulihan; yang dikembalikan adalah nilai simpanan tersebut, bukan angka tetap.
+
+Koreksi untuk target yang sama dibatasi sekitar 80 kali per detik. Target yang tidak dikunci hanya dibaca saat jendela mixer terbuka. Kunci hanyalah record di `config.json` yang ditulis secara atomik lewat berkas sementara; geseran slider di-debounce agar disk tidak ditulis tiap piksel.
 
 ## Batasan
 

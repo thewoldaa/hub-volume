@@ -5,7 +5,7 @@ Unicode true
 
 !define APP_NAME     "Hub Volume"
 !define APP_EXE      "HubVolume.exe"
-!define APP_VERSION  "1.0.0"
+!define APP_VERSION  "1.1.0"
 !define PUBLISHER    "CraftKal"
 !define WND_CLASS    "HubVolume.Main"
 !define UNINST_KEY   "Software\Microsoft\Windows\CurrentVersion\Uninstall\HubVolume"
@@ -56,7 +56,7 @@ BrandingText "${APP_NAME} ${APP_VERSION}  -  ${PUBLISHER}"
 
 !insertmacro MUI_LANGUAGE "Indonesian"
 
-VIProductVersion "1.0.0.0"
+VIProductVersion "1.1.0.0"
 VIAddVersionKey /LANG=${LANG_INDONESIAN} "ProductName"     "${APP_NAME}"
 VIAddVersionKey /LANG=${LANG_INDONESIAN} "CompanyName"     "${PUBLISHER}"
 VIAddVersionKey /LANG=${LANG_INDONESIAN} "FileDescription" "Installer ${APP_NAME}"

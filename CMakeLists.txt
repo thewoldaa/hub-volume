@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(HubVolume VERSION 1.0.0 LANGUAGES CXX RC)
+project(HubVolume VERSION 1.1.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,7 @@ else()
 endif()
 
 target_link_libraries(HubVolume PRIVATE
-  gdiplus ole32 shell32 advapi32 version dwmapi gdi32 user32 uuid
+  gdiplus ole32 shell32 advapi32 version dwmapi gdi32 user32 uuid comdlg32
 )
 
 set_target_properties(HubVolume PROPERTIES OUTPUT_NAME "HubVolume")
